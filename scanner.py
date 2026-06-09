@@ -10,8 +10,6 @@ import gspread
 from google.oauth2.service_account import Credentials
 import yfinance as yf
 
-# ========== BASIC CONFIG ==========
-
 SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID", "")
 CONFIG_SHEET = "CONFIG"
 LIVE_SHEET = "LIVE_SIGNALS"
@@ -22,29 +20,17 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 IST = pytz.timezone("Asia/Kolkata")
 
-# Index strike steps and lot sizes (approx – adjust if you want)
 INDEX_STRIKE_STEP = {"NIFTY": 50, "BANKNIFTY": 100, "SENSEX": 100}
 INDEX_LOT_SIZE = {"NIFTY": 25, "BANKNIFTY": 15, "SENSEX": 10}
-INDEX_MIN_R = {"NIFTY": 10, "BANKNIFTY": 30, "SENSEX": 50}  # min risk in points
-STOCK_MIN_R_PCT = 0.005  # 0.5% minimum risk for stocks
+INDEX_MIN_R = {"NIFTY": 10, "BANKNIFTY": 30, "SENSEX": 50}
+STOCK_MIN_R_PCT = 0.005
 
-
-# ========== HELPERS: IDENTIFIERS & SHEETS ==========
 
 def state_key(symbol: str, mode: str) -> str:
     return f"{symbol}|{mode}"
 
 
 def to_yahoo_ticker(symbol: str, type_: str) -> str:
-    """
-    Map our symbols to Yahoo Finance tickers.
-
-    - NSE stocks: SYMBOL.NS  (e.g. RELIANCE -> RELIANCE.NS)
-    - Indices:
-      NIFTY     -> ^NSEI
-      BANKNIFTY -> ^NSEBANK
-      SENSEX    -> ^BSESN
-    """
     symbol = symbol.upper()
     type_ = type_.upper()
     if type_ == "INDEX":
@@ -191,12 +177,7 @@ def write_state_to_sheet(sh, state_map: Dict[str, Dict]):
     ws.update("A1", values)
 
 
-# ========== DATA FETCH: yfinance (NSE) ==========
-
 def fetch_index_data(symbols: List[str]) -> Dict[str, Dict]:
-    """
-    Fetch 5-min OHLC and indicators for each index symbol using yfinance.
-    """
     results: Dict[str, Dict] = {}
     now_ist = datetime.now(IST)
     today_date = now_ist.date()
@@ -290,9 +271,6 @@ def fetch_index_data(symbols: List[str]) -> Dict[str, Dict]:
 
 
 def fetch_stock_data(symbols: List[str]) -> Dict[str, Dict]:
-    """
-    Fetch 5-min OHLC and indicators for each stock symbol using yfinance.
-    """
     results: Dict[str, Dict] = {}
     now_ist = datetime.now(IST)
     today_date = now_ist.date()
@@ -386,10 +364,6 @@ def fetch_stock_data(symbols: List[str]) -> Dict[str, Dict]:
 
 
 def fetch_option_chain(symbol: str) -> Dict[str, Dict]:
-    """
-    Fetch nearest-expiry option chain for an index via yfinance.
-    Returns: { '24000CE': {'ltp': ...}, '24000PE': {...}, ... }
-    """
     yticker = to_yahoo_ticker(symbol, "INDEX")
     tk = yf.Ticker(yticker)
 
@@ -432,8 +406,6 @@ def fetch_option_chain(symbol: str) -> Dict[str, Dict]:
     return result
 
 
-# ========== DIRECTION HELPERS ==========
-
 def _compute_direction_index(ohlc_window: pd.DataFrame, indicators: Dict) -> str:
     C0 = float(ohlc_window["close"].iloc[-1])
     EMA10 = float(indicators.get("EMA10", C0))
@@ -457,8 +429,6 @@ def _compute_direction_stock(ohlc_window: pd.DataFrame, indicators: Dict) -> str
         return "DOWN"
     return "SIDE"
 
-
-# ========== INDEX STRATEGY ==========
 
 def compute_index_signal(
     config: Dict,
@@ -547,7 +517,6 @@ def compute_index_signal(
     if signal in ("NEW_BUY", "NEW_SELL"):
         entry_under = C0
         R = max(0.5 * ATR14, float(INDEX_MIN_R.get(symbol, 10)))
-        # We don't store underlying SL/T1/T2 into sheet, just use for orientation
 
     strike_symbol = ""
     expiry_str = ""
@@ -610,6 +579,32 @@ def compute_index_signal(
                 elif ce_pe == "PE" and direction != "DOWN":
                     exit_signal = True
                     exit_reason = "Trend flip against PE"
-            if __name__ == "__main__":
-        main()
-             
+            if not exit_signal and t >= datetime.strptime("15:20", "%H:%M").time():
+                exit_signal = True
+                exit_reason = "Time exit"
+            if exit_signal:
+                signal = "EXIT"
+                reason = exit_reason
+            else:
+                signal = "CONTINUE_HOLD"
+                reason = "Hold"
+
+    live_row["SIGNAL"] = signal
+    live_row["STRIKE"] = strike_symbol
+    live_row["EXPIRY"] = expiry_str
+    live_row["CE_PE"] = ce_pe
+    live_row["ENTRY_ZONE_LOW"] = entry_zone_low
+    live_row["ENTRY_ZONE_HIGH"] = entry_zone_high
+    live_row["SL"] = sl_opt
+    live_row["T1"] = t1_opt
+    live_row["T2"] = t2_opt
+    live_row["LTP"] = C0 if not strike_symbol else option_chain.get(strike_symbol, {}).get("ltp", "")
+    live_row["REASON"] = reason
+    live_row["RISK_PER_LOT"] = risk_per_lot
+
+    new_state["SYMBOL"] = symbol
+    new_state["TYPE"] = config["TYPE"]
+    new_state["MODE"] = mode
+    new_state["LAST_STRIKE"] = strike_symbol
+    new_state["LAST_EXPIRY"] = expiry_str
+    new_state["LAST_CE_PE"] = ce
