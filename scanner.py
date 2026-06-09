@@ -611,5 +611,5 @@ def compute_index_signal(
                     exit_signal = True
                     exit_reason = "Trend flip against PE"
             if __name__ == "__main__":
-    main()
+        main()
              
