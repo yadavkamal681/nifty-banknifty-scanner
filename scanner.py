@@ -607,4 +607,270 @@ def compute_index_signal(
     new_state["MODE"] = mode
     new_state["LAST_STRIKE"] = strike_symbol
     new_state["LAST_EXPIRY"] = expiry_str
-    new_state["LAST_CE_PE"] = ce
+    new_state["LAST_CE_PE"] = ce_pe
+    new_state["LAST_SIGNAL"] = signal
+    new_state["LAST_ENTRY_ZONE_LOW"] = entry_zone_low
+    new_state["LAST_ENTRY_ZONE_HIGH"] = entry_zone_high
+    new_state["LAST_SL"] = sl_opt
+    new_state["LAST_T1"] = t1_opt
+    new_state["LAST_T2"] = t2_opt
+    new_state["LAST_LTP"] = live_row["LTP"]
+    new_state["LAST_UPDATED"] = live_row["TIMESTAMP"]
+
+    if signal in ("NEW_BUY", "NEW_SELL"):
+        alert_required = True
+        alert_message = f"{symbol} {signal}"
+    elif signal == "EXIT" and last_signal in ("NEW_BUY", "NEW_SELL", "CONTINUE_HOLD"):
+        alert_required = True
+        alert_message = f"EXIT {symbol} {new_state.get('LAST_STRIKE', '')} - {reason}"
+
+    return live_row, new_state, alert_required, alert_message
+
+
+def compute_stock_signal(
+    config: Dict,
+    ohlc_window: pd.DataFrame,
+    indicators: Dict,
+    last_state: Dict,
+    now_ts: datetime,
+) -> Tuple[Dict, Dict, bool, str]:
+    symbol = config["SYMBOL"]
+    mode = config["MODE"]
+    new_state = last_state.copy() if last_state else empty_state(symbol, mode)
+
+    live_row: Dict = {
+        "TIMESTAMP": now_ts.isoformat(),
+        "SYMBOL": symbol,
+        "TYPE": config["TYPE"],
+        "MODE": mode,
+        "DIRECTION": "SIDE",
+        "STRIKE": "",
+        "EXPIRY": "",
+        "CE_PE": "",
+        "SIGNAL": "NO_SIGNAL",
+        "ENTRY_ZONE_LOW": "",
+        "ENTRY_ZONE_HIGH": "",
+        "SL": "",
+        "T1": "",
+        "T2": "",
+        "LTP": "",
+        "REASON": "",
+        "RISK_PER_LOT": "",
+        "COMMENT": "",
+    }
+
+    alert_required = False
+    alert_message = ""
+
+    t = now_ts.astimezone(IST).time()
+
+    direction = _compute_direction_stock(ohlc_window, indicators)
+    live_row["DIRECTION"] = direction
+
+    C0 = float(ohlc_window["close"].iloc[-1])
+    C1 = float(ohlc_window["close"].iloc[-2]) if len(ohlc_window) >= 2 else C0
+    H0 = float(ohlc_window["high"].iloc[-1])
+    L0 = float(ohlc_window["low"].iloc[-1])
+    H_prev = float(ohlc_window["high"].iloc[-2]) if len(ohlc_window) >= 2 else H0
+    L_prev = float(ohlc_window["low"].iloc[-2]) if len(ohlc_window) >= 2 else L0
+
+    EMA10 = float(indicators.get("EMA10", C0))
+    EMA20 = float(indicators.get("EMA20", C0))
+    ATR14 = float(indicators.get("ATR14", 0))
+    PDH = float(indicators.get("PDH", C0))
+    PDL = float(indicators.get("PDL", C0))
+    ORH = indicators.get("ORH")
+    ORL = indicators.get("ORL")
+
+    if ORH is not None and ORL is not None:
+        key_up_level = max(PDH, float(ORH))
+        key_down_level = min(PDL, float(ORL))
+    else:
+        key_up_level = PDH
+        key_down_level = PDL
+
+    last_signal = str(new_state.get("LAST_SIGNAL", "NO_SIGNAL")).upper()
+
+    signal = "NO_SIGNAL"
+    reason = ""
+
+    if datetime.strptime("09:25", "%H:%M").time() <= t <= datetime.strptime("15:20", "%H:%M").time():
+        if direction == "UP" and last_signal not in ("NEW_BUY", "CONTINUE_HOLD"):
+            breakout_up = (C1 <= key_up_level) and (C0 > key_up_level * 1.001)
+            pullback_long = ((L0 <= EMA10 or L0 <= EMA20) and (C0 > H_prev))
+            if breakout_up or pullback_long:
+                signal = "NEW_BUY"
+                reason = "Trend up + breakout" if breakout_up else "Trend up + EMA pullback"
+        if direction == "DOWN" and last_signal not in ("NEW_SELL", "CONTINUE_HOLD") and signal == "NO_SIGNAL":
+            breakout_down = (C1 >= key_down_level) and (C0 < key_down_level * 0.999)
+            pullback_short = ((H0 >= EMA10 or H0 >= EMA20) and (C0 < L_prev))
+            if breakout_down or pullback_short:
+                signal = "NEW_SELL"
+                reason = "Trend down + breakdown" if breakout_down else "Trend down + EMA pullback"
+
+    entry_stock = None
+    sl_stock = None
+    t1_stock = None
+    t2_stock = None
+    entry_low = None
+    entry_high = None
+
+    if signal in ("NEW_BUY", "NEW_SELL"):
+        entry_stock = C0
+        R = max(0.5 * ATR14, STOCK_MIN_R_PCT * entry_stock)
+        if signal == "NEW_BUY":
+            sl_stock = entry_stock - R
+            t1_stock = entry_stock + R
+            t2_stock = entry_stock + 2 * R
+        else:
+            sl_stock = entry_stock + R
+            t1_stock = entry_stock - R
+            t2_stock = entry_stock - 2 * R
+        entry_low = entry_stock * 0.997
+        entry_high = entry_stock * 1.003
+
+    if signal == "NO_SIGNAL" and last_signal in ("NEW_BUY", "NEW_SELL", "CONTINUE_HOLD"):
+        stock_ltp = C0
+        last_sl = new_state.get("LAST_SL")
+        exit_signal = False
+        exit_reason = ""
+        try:
+            if last_sl not in ("", None) and last_signal in ("NEW_BUY", "CONTINUE_HOLD") and stock_ltp <= float(last_sl):
+                exit_signal = True
+                exit_reason = "Stock SL hit"
+            elif last_sl not in ("", None) and last_signal == "NEW_SELL" and stock_ltp >= float(last_sl):
+                exit_signal = True
+                exit_reason = "Stock SL hit"
+        except Exception:
+            pass
+        if not exit_signal:
+            if last_signal in ("NEW_BUY", "CONTINUE_HOLD") and direction == "DOWN":
+                exit_signal = True
+                exit_reason = "Trend flip against long"
+            elif last_signal in ("NEW_SELL", "CONTINUE_HOLD") and direction == "UP":
+                exit_signal = True
+                exit_reason = "Trend flip against short"
+        if not exit_signal and t >= datetime.strptime("15:20", "%H:%M").time():
+            exit_signal = True
+            exit_reason = "Time exit"
+        if exit_signal:
+            signal = "EXIT"
+            reason = exit_reason
+        else:
+            signal = "CONTINUE_HOLD"
+            reason = "Hold"
+            entry_low = new_state.get("LAST_ENTRY_ZONE_LOW")
+            entry_high = new_state.get("LAST_ENTRY_ZONE_HIGH")
+            sl_stock = new_state.get("LAST_SL")
+            t1_stock = new_state.get("LAST_T1")
+            t2_stock = new_state.get("LAST_T2")
+
+    live_row["SIGNAL"] = signal
+    live_row["ENTRY_ZONE_LOW"] = entry_low or ""
+    live_row["ENTRY_ZONE_HIGH"] = entry_high or ""
+    live_row["SL"] = sl_stock or ""
+    live_row["T1"] = t1_stock or ""
+    live_row["T2"] = t2_stock or ""
+    live_row["LTP"] = C0
+    live_row["REASON"] = reason
+
+    new_state["SYMBOL"] = symbol
+    new_state["TYPE"] = config["TYPE"]
+    new_state["MODE"] = mode
+    new_state["LAST_STRIKE"] = ""
+    new_state["LAST_EXPIRY"] = ""
+    new_state["LAST_CE_PE"] = ""
+    new_state["LAST_SIGNAL"] = signal
+    new_state["LAST_ENTRY_ZONE_LOW"] = entry_low or ""
+    new_state["LAST_ENTRY_ZONE_HIGH"] = entry_high or ""
+    new_state["LAST_SL"] = sl_stock or ""
+    new_state["LAST_T1"] = t1_stock or ""
+    new_state["LAST_T2"] = t2_stock or ""
+    new_state["LAST_LTP"] = C0
+    new_state["LAST_UPDATED"] = live_row["TIMESTAMP"]
+
+    if signal in ("NEW_BUY", "NEW_SELL"):
+        alert_required = True
+        alert_message = f"{symbol} {signal}"
+    elif signal == "EXIT" and last_signal in ("NEW_BUY", "NEW_SELL", "CONTINUE_HOLD"):
+        alert_required = True
+        alert_message = f"EXIT {symbol} - {reason}"
+
+    return live_row, new_state, alert_required, alert_message
+
+
+def send_telegram_alerts(alerts: List[str]):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    for msg in alerts:
+        try:
+            payload = {"chat_id": TELEGRAM_CHAT_ID, "text": msg}
+            requests.post(url, json=payload, timeout=10)
+        except Exception:
+            continue
+
+
+def main():
+    now_ts = datetime.now(IST)
+    sh = open_sheet()
+
+    configs = load_config_from_sheet(sh)
+    state_map = load_state_from_sheet(sh)
+
+    index_configs = [c for c in configs if c["TYPE"] == "INDEX" and c["MODE"] in ("INTRADAY", "BOTH")]
+    stock_configs = [c for c in configs if c["TYPE"] == "STOCK" and c["MODE"] in ("INTRADAY", "BOTH")]
+
+    index_symbols = [c["SYMBOL"] for c in index_configs]
+    stock_symbols = [c["SYMBOL"] for c in stock_configs]
+
+    index_data = fetch_index_data(index_symbols)
+    stock_data = fetch_stock_data(stock_symbols)
+    option_data = {sym: fetch_option_chain(sym) for sym in index_symbols}
+
+    live_rows: List[Dict] = []
+    new_state_map: Dict[str, Dict] = dict(state_map)
+    alerts: List[str] = []
+
+    for cfg in index_configs:
+        symbol = cfg["SYMBOL"]
+        key = state_key(symbol, cfg["MODE"])
+        last_state = new_state_map.get(key, empty_state(symbol, cfg["MODE"]))
+        data = index_data.get(symbol)
+        if not data:
+            continue
+        ohlc_window = data["ohlc_window"]
+        indicators = data["indicators"]
+        chain = option_data.get(symbol, {})
+        live_row, new_state, alert_required, alert_message = compute_index_signal(
+            cfg, ohlc_window, indicators, last_state, chain, now_ts
+        )
+        live_rows.append(live_row)
+        new_state_map[key] = new_state
+        if alert_required and alert_message:
+            alerts.append(alert_message)
+
+    for cfg in stock_configs:
+        symbol = cfg["SYMBOL"]
+        key = state_key(symbol, cfg["MODE"])
+        last_state = new_state_map.get(key, empty_state(symbol, cfg["MODE"]))
+        data = stock_data.get(symbol)
+        if not data:
+            continue
+        ohlc_window = data["ohlc_window"]
+        indicators = data["indicators"]
+        live_row, new_state, alert_required, alert_message = compute_stock_signal(
+            cfg, ohlc_window, indicators, last_state, now_ts
+        )
+        live_rows.append(live_row)
+        new_state_map[key] = new_state
+        if alert_required and alert_message:
+            alerts.append(alert_message)
+
+    write_live_signals_to_sheet(sh, live_rows)
+    write_state_to_sheet(sh, new_state_map)
+    send_telegram_alerts(alerts)
+
+
+if __name__ == "__main__":
+    main()
