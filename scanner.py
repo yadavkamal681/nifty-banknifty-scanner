@@ -610,5 +610,6 @@ def compute_index_signal(
                 elif ce_pe == "PE" and direction != "DOWN":
                     exit_signal = True
                     exit_reason = "Trend flip against PE"
-            if not exit_signal and t >= datetime.strptime("15:20", "%H:%M").time():
+            if __name__ == "__main__":
+    main()
              
