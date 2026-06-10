@@ -1,7 +1,7 @@
 import os
 import json
 from datetime import datetime
-from typing import List
+from typing import Dict, List
 
 import requests
 import pytz
@@ -11,8 +11,12 @@ from google.oauth2.service_account import Credentials
 import yfinance as yf
 
 IST = pytz.timezone("Asia/Kolkata")
+
 SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID", "")
+CONFIG_SHEET = "CONFIG"
 LIVE_SHEET = "LIVE_SIGNALS"
+STATE_SHEET = "STATE"
+
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
@@ -36,16 +40,17 @@ def open_sheet():
     return get_gspread_client().open_by_key(SPREADSHEET_ID)
 
 
-def ensure_live_sheet(sh):
+def ensure_sheet(sh, title: str, rows: str = "1000", cols: str = "20"):
     try:
-        return sh.worksheet(LIVE_SHEET)
+        return sh.worksheet(title)
     except gspread.exceptions.WorksheetNotFound:
-        return sh.add_worksheet(title=LIVE_SHEET, rows="1000", cols="10")
+        return sh.add_worksheet(title=title, rows=rows, cols=cols)
 
 
-def to_yahoo_ticker(symbol: str, is_index: bool) -> str:
-    s = symbol.upper()
-    if is_index:
+def to_yahoo_ticker(symbol: str, type_: str) -> str:
+    s = symbol.upper().strip()
+    t = type_.upper().strip()
+    if t == "INDEX":
         if s == "NIFTY":
             return "^NSEI"
         if s == "BANKNIFTY":
@@ -55,25 +60,147 @@ def to_yahoo_ticker(symbol: str, is_index: bool) -> str:
     return f"{s}.NS"
 
 
-def fetch_last_close(symbol: str, is_index: bool) -> float:
-    ticker = to_yahoo_ticker(symbol, is_index)
+def load_config(sh) -> List[Dict]:
+    ws = sh.worksheet(CONFIG_SHEET)
+    rows = ws.get_all_records()
+    out: List[Dict] = []
+    for row in rows:
+        active = str(row.get("ACTIVE", "")).strip().upper()
+        if active != "TRUE":
+            continue
+        symbol = str(row.get("SYMBOL", "")).strip().upper()
+        type_ = str(row.get("TYPE", "")).strip().upper()
+        mode = str(row.get("MODE", "INTRADAY")).strip().upper()
+        notes = str(row.get("NOTES", "")).strip()
+        if not symbol or type_ not in ("INDEX", "STOCK"):
+            continue
+        if mode not in ("INTRADAY", "SWING", "BOTH"):
+            mode = "INTRADAY"
+        out.append(
+            {
+                "SYMBOL": symbol,
+                "TYPE": type_,
+                "MODE": mode,
+                "NOTES": notes,
+            }
+        )
+    return out
+
+
+def fetch_symbol_snapshot(symbol: str, type_: str) -> Dict:
+    ticker = to_yahoo_ticker(symbol, type_)
     df = yf.download(
         ticker,
-        period="2d",
+        period="5d",
         interval="5m",
         auto_adjust=True,
         progress=False,
     )
     if df.empty:
         raise RuntimeError(f"No data for {symbol}")
+
     if df.index.tz is None:
         df.index = df.index.tz_localize("UTC").tz_convert(IST)
     else:
         df.index = df.index.tz_convert(IST)
-    close_val = df.iloc[-1]["Close"]
-    if isinstance(close_val, pd.Series):
-        close_val = close_val.iloc[0]
-    return float(close_val)
+
+    close_series = df["Close"]
+    high_series = df["High"]
+    low_series = df["Low"]
+
+    if isinstance(close_series, pd.DataFrame):
+        close_series = close_series.iloc[:, 0]
+    if isinstance(high_series, pd.DataFrame):
+        high_series = high_series.iloc[:, 0]
+    if isinstance(low_series, pd.DataFrame):
+        low_series = low_series.iloc[:, 0]
+
+    last_price = float(close_series.iloc[-1])
+    prev_price = float(close_series.iloc[-2]) if len(close_series) >= 2 else last_price
+    change_pct = ((last_price - prev_price) / prev_price * 100.0) if prev_price else 0.0
+
+    ema9 = close_series.ewm(span=9, adjust=False).mean()
+    ema21 = close_series.ewm(span=21, adjust=False).mean()
+    ema9_last = float(ema9.iloc[-1])
+    ema21_last = float(ema21.iloc[-1])
+
+    direction = "SIDEWAYS"
+    signal = "WATCH"
+    if ema9_last > ema21_last and last_price > ema9_last:
+        direction = "UP"
+        signal = "BULLISH"
+    elif ema9_last < ema21_last and last_price < ema9_last:
+        direction = "DOWN"
+        signal = "BEARISH"
+
+    day_high = float(high_series.tail(75).max()) if len(high_series) >= 1 else last_price
+    day_low = float(low_series.tail(75).min()) if len(low_series) >= 1 else last_price
+
+    return {
+        "LAST_PRICE": round(last_price, 2),
+        "PREV_PRICE": round(prev_price, 2),
+        "CHANGE_PCT": round(change_pct, 2),
+        "EMA9": round(ema9_last, 2),
+        "EMA21": round(ema21_last, 2),
+        "DIRECTION": direction,
+        "SIGNAL": signal,
+        "DAY_HIGH": round(day_high, 2),
+        "DAY_LOW": round(day_low, 2),
+    }
+
+
+def load_state_map(sh) -> Dict[str, Dict]:
+    ws = ensure_sheet(sh, STATE_SHEET)
+    rows = ws.get_all_records()
+    state_map: Dict[str, Dict] = {}
+    for row in rows:
+        key = f"{str(row.get('SYMBOL', '')).strip().upper()}|{str(row.get('MODE', '')).strip().upper()}"
+        if key == "|":
+            continue
+        state_map[key] = row
+    return state_map
+
+
+def write_state_map(sh, state_rows: List[Dict]):
+    ws = ensure_sheet(sh, STATE_SHEET)
+    headers = [
+        "SYMBOL",
+        "TYPE",
+        "MODE",
+        "LAST_SIGNAL",
+        "LAST_PRICE",
+        "LAST_UPDATED",
+    ]
+    values = [headers]
+    for row in state_rows:
+        values.append([row.get(h, "") for h in headers])
+    ws.clear()
+    ws.update("A1", values)
+
+
+def write_live_signals(sh, live_rows: List[Dict]):
+    ws = ensure_sheet(sh, LIVE_SHEET)
+    headers = [
+        "TIMESTAMP",
+        "SYMBOL",
+        "TYPE",
+        "MODE",
+        "LAST_PRICE",
+        "CHANGE_PCT",
+        "EMA9",
+        "EMA21",
+        "DIRECTION",
+        "SIGNAL",
+        "DAY_HIGH",
+        "DAY_LOW",
+        "NOTES",
+        "STATUS",
+    ]
+    values = [headers]
+    for row in live_rows:
+        values.append([row.get(h, "") for h in headers])
+    ws.clear()
+    ws.update("A1", values)
 
 
 def send_telegram(message: str):
@@ -89,30 +216,97 @@ def send_telegram(message: str):
 
 def main():
     sh = open_sheet()
-    ws = ensure_live_sheet(sh)
-
-    symbols = [
-        ("NIFTY", True),
-        ("BANKNIFTY", True),
-    ]
+    config_rows = load_config(sh)
+    state_map = load_state_map(sh)
 
     now = datetime.now(IST).isoformat()
-    rows: List[List[str]] = [["TIMESTAMP", "SYMBOL", "IS_INDEX", "LAST_CLOSE"]]
-    messages: List[str] = []
+    live_rows: List[Dict] = []
+    new_state_rows: List[Dict] = []
+    alert_lines: List[str] = []
 
-    for sym, is_index in symbols:
+    for cfg in config_rows:
+        symbol = cfg["SYMBOL"]
+        type_ = cfg["TYPE"]
+        mode = cfg["MODE"]
+        notes = cfg["NOTES"]
+        key = f"{symbol}|{mode}"
+        prev_state = state_map.get(key, {})
+
         try:
-            last_close = fetch_last_close(sym, is_index)
-            rows.append([now, sym, "INDEX" if is_index else "STOCK", f"{last_close:.2f}"])
-            messages.append(f"{sym}: {last_close:.2f}")
+            snap = fetch_symbol_snapshot(symbol, type_)
+            prev_signal = str(prev_state.get("LAST_SIGNAL", "")).strip().upper()
+            new_signal = snap["SIGNAL"]
+            status = "UNCHANGED"
+            if prev_signal != new_signal:
+                status = "NEW_SIGNAL"
+                alert_lines.append(
+                    f"{symbol} ({mode}) -> {new_signal} | Price: {snap['LAST_PRICE']} | Dir: {snap['DIRECTION']}"
+                )
+
+            live_rows.append(
+                {
+                    "TIMESTAMP": now,
+                    "SYMBOL": symbol,
+                    "TYPE": type_,
+                    "MODE": mode,
+                    "LAST_PRICE": snap["LAST_PRICE"],
+                    "CHANGE_PCT": snap["CHANGE_PCT"],
+                    "EMA9": snap["EMA9"],
+                    "EMA21": snap["EMA21"],
+                    "DIRECTION": snap["DIRECTION"],
+                    "SIGNAL": snap["SIGNAL"],
+                    "DAY_HIGH": snap["DAY_HIGH"],
+                    "DAY_LOW": snap["DAY_LOW"],
+                    "NOTES": notes,
+                    "STATUS": status,
+                }
+            )
+
+            new_state_rows.append(
+                {
+                    "SYMBOL": symbol,
+                    "TYPE": type_,
+                    "MODE": mode,
+                    "LAST_SIGNAL": snap["SIGNAL"],
+                    "LAST_PRICE": snap["LAST_PRICE"],
+                    "LAST_UPDATED": now,
+                }
+            )
         except Exception as e:
-            rows.append([now, sym, "INDEX" if is_index else "STOCK", f"ERROR: {e}"])
+            live_rows.append(
+                {
+                    "TIMESTAMP": now,
+                    "SYMBOL": symbol,
+                    "TYPE": type_,
+                    "MODE": mode,
+                    "LAST_PRICE": "",
+                    "CHANGE_PCT": "",
+                    "EMA9": "",
+                    "EMA21": "",
+                    "DIRECTION": "",
+                    "SIGNAL": "ERROR",
+                    "DAY_HIGH": "",
+                    "DAY_LOW": "",
+                    "NOTES": notes,
+                    "STATUS": f"ERROR: {e}",
+                }
+            )
+            new_state_rows.append(
+                {
+                    "SYMBOL": symbol,
+                    "TYPE": type_,
+                    "MODE": mode,
+                    "LAST_SIGNAL": "ERROR",
+                    "LAST_PRICE": "",
+                    "LAST_UPDATED": now,
+                }
+            )
 
-    ws.clear()
-    ws.update("A1", rows)
+    write_live_signals(sh, live_rows)
+    write_state_map(sh, new_state_rows)
 
-    if messages:
-        message = chr(10).join(["Scanner update:"] + messages)
+    if alert_lines:
+        message = chr(10).join(["Scanner V2 updates:"] + alert_lines)
         send_telegram(message)
 
 
