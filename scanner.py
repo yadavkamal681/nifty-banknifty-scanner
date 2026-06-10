@@ -23,7 +23,6 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 EMA_STRATEGY = "EMA_BREAKOUT"
 DMA_STRATEGY = "DMA"
 BOTH_STRATEGY = "BOTH"
-VALID_STRATEGIES = {EMA_STRATEGY, DMA_STRATEGY, BOTH_STRATEGY}
 
 
 def get_gspread_client():
@@ -250,7 +249,7 @@ def derive_dma_plan(df: pd.DataFrame, type_: str) -> Dict:
         t1, t2 = round(entry - risk, 2), round(entry - 2 * risk, 2)
     else:
         entry = round(last_close, 2)
-        sl = round(d50, 2)
+        sl = round(d50, 2) if d50 is not None else ""
         t1, t2 = round(last_close, 2), round(last_close, 2)
     rr = 0.0
     if action == "BUY" and entry > sl:
@@ -259,7 +258,7 @@ def derive_dma_plan(df: pd.DataFrame, type_: str) -> Dict:
         rr = round((entry - t1) / (sl - entry), 2)
     return {
         "DMA50": round(d50, 2), "DMA100": round(d100, 2), "DMA200": round(d200, 2),
-        "DMA_SIGNAL": signal, "DMA_ACTION": action, "DMA_ENTRY": round(entry, 2), "DMA_SL": round(sl, 2),
+        "DMA_SIGNAL": signal, "DMA_ACTION": action, "DMA_ENTRY": round(entry, 2), "DMA_SL": sl,
         "DMA_TARGET_1": round(t1, 2), "DMA_TARGET_2": round(t2, 2), "DMA_RR": rr, "DMA_STATUS": status
     }
 
@@ -305,7 +304,11 @@ def send_telegram(message: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     try:
-        requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": message}, timeout=10)
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": message},
+            timeout=10,
+        )
     except Exception:
         pass
 
@@ -316,11 +319,10 @@ def build_daily_dma_summary(rows: List[Dict]) -> str:
     lines = ["Daily DMA closing list", "", f"BUY count: {len(buy_rows)}"]
     for r in buy_rows[:25]:
         lines.append(f"- {r['SYMBOL']} | Entry {r['DMA_ENTRY']} | SL {r['DMA_SL']} | T2 {r['DMA_TARGET_2']}")
-    lines += ["", f"SELL count: {len(sell_rows)}"]
+    lines.extend(["", f"SELL count: {len(sell_rows)}"])
     for r in sell_rows[:25]:
         lines.append(f"- {r['SYMBOL']} | Entry {r['DMA_ENTRY']} | SL {r['DMA_SL']} | T2 {r['DMA_TARGET_2']}")
-    return "
-".join(lines)
+    return "\n".join(lines)
 
 
 def main():
@@ -419,10 +421,7 @@ def main():
     write_state_map(sh, state_rows)
 
     if alerts:
-        send_telegram("Scanner config strategy alerts
-
-" + "
-".join(alerts[:20]))
+        send_telegram("Scanner config strategy alerts\n\n" + "\n".join(alerts[:20]))
     if market_closed(now):
         send_telegram(build_daily_dma_summary(dma_summary_rows))
 
