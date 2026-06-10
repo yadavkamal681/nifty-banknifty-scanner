@@ -310,7 +310,7 @@ def fetch_stock_data(symbols: List[str]) -> Dict[str, Dict]:
             last_close = float(last_close_entry.iloc[0])
         else:
             last_close = float(last_close_entry)
-        PDH = PDL = last_close)
+        PDH = PDL = last_close
         if len(df_daily) >= 2:
             last_completed = df_daily.iloc[-2]
             PDH = float(last_completed["High"])
