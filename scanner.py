@@ -305,7 +305,12 @@ def fetch_stock_data(symbols: List[str]) -> Dict[str, Dict]:
             auto_adjust=True,
             progress=False,
         )
-        PDH = PDL = float(df_today["Close"].iloc[-1])
+        last_close_entry = df_today["Close"].iloc[-1]
+        if isinstance(last_close_entry, pd.Series):
+            last_close = float(last_close_entry.iloc[0])
+        else:
+            last_close = float(last_close_entry)
+        PDH = PDL = last_close)
         if len(df_daily) >= 2:
             last_completed = df_daily.iloc[-2]
             PDH = float(last_completed["High"])
