@@ -178,6 +178,110 @@ def write_state_to_sheet(sh, state_map: Dict[str, Dict]):
 
 
 def fetch_index_data(symbols: List[str]) -> Dict[str, Dict]:
+    """
+    Fetch 5-min OHLC and indicators for each index symbol using yfinance.
+    """
+    results: Dict[str, Dict] = {}
+    now_ist = datetime.now(IST)
+    today_date = now_ist.date()
+
+    for symbol in symbols:
+        yticker = to_yahoo_ticker(symbol, "INDEX")
+
+        df = yf.download(
+            yticker,
+            period="2d",
+            interval="5m",
+            auto_adjust=True,
+            progress=False,
+        )
+        if df.empty:
+            continue
+
+        if df.index.tz is None:
+            df.index = df.index.tz_localize("UTC").tz_convert(IST)
+        else:
+            df.index = df.index.tz_convert(IST)
+
+        df_today = df[df.index.date == today_date]
+        if df_today.empty:
+            last_date = df.index.date[-1]
+            df_today = df[df.index.date == last_date]
+
+        df_daily = yf.download(
+            yticker,
+            period="5d",
+            interval="1d",
+            auto_adjust=True,
+            progress=False,
+        )
+
+        # last close for PDH/PDL fallback
+        last_close_entry = df_today["Close"].iloc[-1]
+        if isinstance(last_close_entry, pd.Series):
+            last_close = float(last_close_entry.iloc[0])
+        else:
+            last_close = float(last_close_entry)
+        PDH = PDL = last_close
+
+        if len(df_daily) >= 2:
+            last_completed = df_daily.iloc[-2]
+            PDH = float(last_completed["High"])
+            PDL = float(last_completed["Low"])
+
+        ohlc_today = df_today[["Open", "High", "Low", "Close"]].rename(
+            columns={"Open": "open", "High": "high", "Low": "low", "Close": "close"}
+        )
+
+        ema10 = ohlc_today["close"].ewm(span=10, adjust=False).mean()
+        ema20 = ohlc_today["close"].ewm(span=20, adjust=False).mean()
+
+        if "Volume" in df_today.columns:
+            pv = df_today["Close"] * df_today["Volume"]
+            vwap_today = pv.cumsum() / df_today["Volume"].cumsum()
+            VWAP = float(vwap_today.iloc[-1])
+        else:
+            VWAP = float(ohlc_today["close"].iloc[-1])
+
+        high = ohlc_today["high"]
+        low = ohlc_today["low"]
+        close = ohlc_today["close"]
+        prev_close = close.shift(1)
+        tr = pd.concat(
+            [
+                (high - low),
+                (high - prev_close).abs(),
+                (low - prev_close).abs(),
+            ],
+            axis=1,
+        ).max(axis=1)
+        atr14 = tr.rolling(window=14, min_periods=1).mean()
+        ATR14 = float(atr14.iloc[-1])
+
+        orh = orl = None
+        if len(ohlc_today) >= 3:
+            first3 = ohlc_today.iloc[:3]
+            orh = float(first3["high"].max())
+            orl = float(first3["low"].min())
+
+        results[symbol] = {
+            "ohlc_window": ohlc_today,
+            "indicators": {
+                "EMA10": float(ema10.iloc[-1]),
+                "EMA20": float(ema20.iloc[-1]),
+                "VWAP": VWAP,
+                "ATR14": ATR14,
+                "PDH": PDH,
+                "PDL": PDL,
+                "ORH": orh,
+                "ORL": orl,
+            },
+        }
+
+    return results
+    
+    
+    def fetch_index_data(symbols: List[str]) -> Dict[str, Dict]:
     results: Dict[str, Dict] = {}
     now_ist = datetime.now(IST)
     today_date = now_ist.date()
