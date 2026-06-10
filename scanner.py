@@ -69,7 +69,7 @@ def to_yahoo_ticker(symbol: str, is_index: bool) -> str:
 
 
 def fetch_last_close(symbol: str, is_index: bool) -> float:
-    """Fetch last 5‑minute close price for the symbol from Yahoo Finance."""
+    """Fetch last 5minute close price for the symbol from Yahoo Finance."""
     ticker = to_yahoo_ticker(symbol, is_index)
     df = yf.download(
         ticker,
