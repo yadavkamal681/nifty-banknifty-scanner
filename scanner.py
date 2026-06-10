@@ -138,11 +138,12 @@ def main():
     ws.clear()
     ws.update("A1", rows)
 
-    # Send Telegram summary
+    # Send Telegram summary (build message separately to avoid string issues)
     if messages:
-        send_telegram("Scanner update:
-" + "
-".join(messages))
+        msg_lines = ["Scanner update:"] + messages
+        message = "
+".join(msg_lines)
+        send_telegram(message)
 
 
 if __name__ == "__main__":
