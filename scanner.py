@@ -1,6 +1,6 @@
 import os
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List
 
 import requests
@@ -29,6 +29,9 @@ EMA_STRATEGY = "EMA_BREAKOUT"
 DMA_STRATEGY = "DMA"
 BOTH_STRATEGY = "BOTH"
 SUMMARY_TIMES = ["09:10","09:25","10:00","11:00","11:30","12:00","12:30","13:00","13:30","14:00","14:30","15:20","20:30"]
+FAST_ALERT_THRESHOLD = 32
+HIGH_ALERT_THRESHOLD = 50
+REMINDER_GAP_MINUTES = 12
 SECTOR_MAP = {
     "BANKING": ["HDFCBANK.NS","ICICIBANK.NS","SBIN.NS","AXISBANK.NS","KOTAKBANK.NS"],
     "IT": ["TCS.NS","INFY.NS","WIPRO.NS","HCLTECH.NS","TECHM.NS"],
@@ -62,7 +65,7 @@ def open_sheet():
         raise RuntimeError("SPREADSHEET_ID not set")
     return get_gspread_client().open_by_key(SPREADSHEET_ID)
 
-def ensure_sheet(sh, title: str, rows: str = "3000", cols: str = "160"):
+def ensure_sheet(sh, title: str, rows: str = "4000", cols: str = "180"):
     try:
         return sh.worksheet(title)
     except gspread.exceptions.WorksheetNotFound:
@@ -279,11 +282,16 @@ def write_state_map(sh, rows: List[Dict]):
 def load_telegram_state(sh) -> Dict[str, Dict]:
     ws = ensure_sheet(sh, TELEGRAM_STATE_SHEET)
     rows = ws.get_all_records()
-    return {str(r.get("SUMMARY_SLOT", "")): r for r in rows if str(r.get("SUMMARY_SLOT", ""))}
+    out = {}
+    for r in rows:
+        k = str(r.get("KEY", "")).strip()
+        if k:
+            out[k] = r
+    return out
 
 def write_telegram_state(sh, rows: List[Dict]):
     ws = ensure_sheet(sh, TELEGRAM_STATE_SHEET)
-    headers = ["SUMMARY_SLOT","SUMMARY_DATE","LAST_SENT_AT"]
+    headers = ["KEY","SUMMARY_SLOT","SUMMARY_DATE","LAST_SENT_AT","LAST_ALERT_TYPE","LAST_SYMBOL","LAST_MODE"]
     write_table(ws, headers, rows)
 
 def fetch_news_headlines(query: str, page_size: int = 3) -> List[str]:
@@ -461,12 +469,13 @@ def compute_smart_score(row: Dict, market_regime: str, sector_info: Dict) -> Dic
     else: sector_bonus = -4 if sector_mood != "NA" else 0
     regime_bonus = 0
     if market_regime == "TREND_DAY" and action in ("BUY", "SELL"): regime_bonus = 8
-    elif market_regime == "CHOPPY" and row.get("MODE") == "INTRADAY": regime_bonus = -10
+    elif market_regime == "CHOPPY" and row.get("MODE") == "INTRADAY": regime_bonus = -6
     elif market_regime == "HIGH_VOLATILITY": regime_bonus = -4
     smart_score = round(base + sector_bonus + regime_bonus, 2)
-    quality = "HIGH" if smart_score >= 55 else "MEDIUM" if smart_score >= 35 else "LOW"
-    smart_alert = "YES" if quality == "HIGH" or (quality == "MEDIUM" and market_regime == "TREND_DAY") else "NO"
-    return {"BASE_SCORE": round(base,2), "SECTOR_BONUS": sector_bonus, "REGIME_BONUS": regime_bonus, "SMART_SCORE": smart_score, "ALERT_QUALITY": quality, "SMART_ALERT": smart_alert, "SECTOR_MOOD": sector_mood}
+    quality = "HIGH" if smart_score >= HIGH_ALERT_THRESHOLD else "MEDIUM" if smart_score >= FAST_ALERT_THRESHOLD else "LOW"
+    fast_alert = "YES" if smart_score >= FAST_ALERT_THRESHOLD and action in ("BUY", "SELL") else "NO"
+    high_alert = "YES" if smart_score >= HIGH_ALERT_THRESHOLD and action in ("BUY", "SELL") else "NO"
+    return {"BASE_SCORE": round(base,2), "SECTOR_BONUS": sector_bonus, "REGIME_BONUS": regime_bonus, "SMART_SCORE": smart_score, "ALERT_QUALITY": quality, "FAST_ALERT": fast_alert, "HIGH_ALERT": high_alert, "SECTOR_MOOD": sector_mood}
 
 def send_telegram(message: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -503,18 +512,31 @@ def eligible_summary_slot(now: datetime) -> str:
 
 def should_send_summary(slot: str, tg_state: Dict[str, Dict], today: str) -> bool:
     if not slot: return False
-    prev = tg_state.get(slot, {})
+    prev = tg_state.get(f"SUMMARY|{slot}", {})
     return str(prev.get("SUMMARY_DATE", "")) != today
+
+def should_send_reminder(key: str, tg_state: Dict[str, Dict], now: datetime) -> bool:
+    prev = tg_state.get(key, {})
+    ts = str(prev.get("LAST_SENT_AT", "")).strip()
+    if not ts:
+        return True
+    try:
+        last_dt = datetime.fromisoformat(ts)
+        if last_dt.tzinfo is None:
+            last_dt = IST.localize(last_dt)
+        return now >= last_dt + timedelta(minutes=REMINDER_GAP_MINUTES)
+    except Exception:
+        return True
 
 def write_live_signals(sh, rows: List[Dict]):
     ws = ensure_sheet(sh, LIVE_SHEET)
-    headers = ["TIMESTAMP","SYMBOL","TYPE","MODE","CONFIG_STRATEGY","NOTES","UNDERLYING_FOR_OPTIONS","MAX_RISK_MODE","STRIKE_OFFSET_STEPS","SECTOR","SECTOR_MOOD","MARKET_REGIME","EMA_LAST_PRICE","EMA_CHANGE_PCT","EMA9","EMA21","EMA50","EMA_RECENT_HIGH","EMA_RECENT_LOW","EMA_ATR","EMA_BIAS","EMA_ACTION","EMA_SIGNAL","EMA_ENTRY","EMA_SL","EMA_TARGET_1","EMA_TARGET_2","EMA_TARGET_3","EMA_RR","DMA50","DMA100","DMA200","DMA_SIGNAL","DMA_ACTION","DMA_ENTRY","DMA_SL","DMA_TARGET_1","DMA_TARGET_2","DMA_TARGET_3","DMA_RR","DMA_STATUS","SUPPORT_1","SUPPORT_2","SUPPORT_3","RESISTANCE_1","RESISTANCE_2","RESISTANCE_3","PIVOT","OPTION_UNDERLYING","OPTION_SIDE","OPTION_BASE_STRIKE","OPTION_SUGGESTED_STRIKE","OPTION_STRIKE_STEP","OPTION_MAX_RISK_MODE","OPTION_STRIKE_OFFSET_STEPS","OPTION_RISK_POINTS","RISK_PER_TRADE_RUPEES","RISK_PER_UNIT","SUGGESTED_QTY","SUGGESTED_LOTS","MAX_OPEN_TRADES","MAX_DAILY_LOSS_PERCENT","INVALIDATION_STATUS","EARNINGS_EVENT_DATE","EARNINGS_DAYS_LEFT","BASE_SCORE","SECTOR_BONUS","REGIME_BONUS","SMART_SCORE","ALERT_QUALITY","SMART_ALERT","STATUS"]
+    headers = ["TIMESTAMP","SYMBOL","TYPE","MODE","CONFIG_STRATEGY","NOTES","UNDERLYING_FOR_OPTIONS","MAX_RISK_MODE","STRIKE_OFFSET_STEPS","SECTOR","SECTOR_MOOD","MARKET_REGIME","EMA_LAST_PRICE","EMA_CHANGE_PCT","EMA9","EMA21","EMA50","EMA_RECENT_HIGH","EMA_RECENT_LOW","EMA_ATR","EMA_BIAS","EMA_ACTION","EMA_SIGNAL","EMA_ENTRY","EMA_SL","EMA_TARGET_1","EMA_TARGET_2","EMA_TARGET_3","EMA_RR","DMA50","DMA100","DMA200","DMA_SIGNAL","DMA_ACTION","DMA_ENTRY","DMA_SL","DMA_TARGET_1","DMA_TARGET_2","DMA_TARGET_3","DMA_RR","DMA_STATUS","SUPPORT_1","SUPPORT_2","SUPPORT_3","RESISTANCE_1","RESISTANCE_2","RESISTANCE_3","PIVOT","OPTION_UNDERLYING","OPTION_SIDE","OPTION_BASE_STRIKE","OPTION_SUGGESTED_STRIKE","OPTION_STRIKE_STEP","OPTION_MAX_RISK_MODE","OPTION_STRIKE_OFFSET_STEPS","OPTION_RISK_POINTS","RISK_PER_TRADE_RUPEES","RISK_PER_UNIT","SUGGESTED_QTY","SUGGESTED_LOTS","MAX_OPEN_TRADES","MAX_DAILY_LOSS_PERCENT","INVALIDATION_STATUS","EARNINGS_EVENT_DATE","EARNINGS_DAYS_LEFT","BASE_SCORE","SECTOR_BONUS","REGIME_BONUS","SMART_SCORE","ALERT_QUALITY","FAST_ALERT","HIGH_ALERT","STATUS"]
     write_table(ws, headers, rows)
 
 def write_ranked_signals(sh, rows: List[Dict]):
     ws = ensure_sheet(sh, RANKED_SHEET)
     ranked = sorted(rows, key=lambda x: x.get("SMART_SCORE", 0), reverse=True)
-    headers = ["TIMESTAMP","SYMBOL","TYPE","MODE","SECTOR","SECTOR_MOOD","MARKET_REGIME","SMART_SCORE","ALERT_QUALITY","SMART_ALERT","EMA_ACTION","DMA_ACTION","EMA_ENTRY","EMA_SL","EMA_TARGET_1","EMA_RR","SUGGESTED_QTY","SUGGESTED_LOTS","INVALIDATION_STATUS","EARNINGS_EVENT_DATE","EARNINGS_DAYS_LEFT","SUPPORT_1","RESISTANCE_1","OPTION_SIDE","OPTION_SUGGESTED_STRIKE","OPTION_RISK_POINTS","STATUS"]
+    headers = ["TIMESTAMP","SYMBOL","TYPE","MODE","SECTOR","SECTOR_MOOD","MARKET_REGIME","SMART_SCORE","ALERT_QUALITY","FAST_ALERT","HIGH_ALERT","EMA_ACTION","DMA_ACTION","EMA_ENTRY","EMA_SL","EMA_TARGET_1","EMA_RR","SUGGESTED_QTY","SUGGESTED_LOTS","INVALIDATION_STATUS","EARNINGS_EVENT_DATE","EARNINGS_DAYS_LEFT","SUPPORT_1","RESISTANCE_1","OPTION_SIDE","OPTION_SUGGESTED_STRIKE","OPTION_RISK_POINTS","STATUS"]
     write_table(ws, headers, ranked)
 
 def main():
@@ -532,7 +554,8 @@ def main():
     earnings_map = earnings_lookup_map(earnings_rows)
     sector_rows = compute_sector_strength()
     sector_lookup = sector_map_lookup(sector_rows)
-    live_rows, state_rows, instant_alerts, invalidation_alerts = [], [], [], []
+    live_rows, state_rows, fast_alerts, high_alerts, invalidation_alerts = [], [], [], [], []
+    new_tg_rows = [v for v in tg_state.values() if str(v.get('KEY','')).startswith('SUMMARY|')]
     for cfg in cfg_rows:
         symbol, type_, mode, notes, strategy = cfg["SYMBOL"], cfg["TYPE"], cfg["MODE"], cfg["NOTES"], cfg["STRATEGY"]
         key = f"{symbol}|{mode}"
@@ -559,22 +582,44 @@ def main():
             sector_info = sector_lookup.get(sector_name, {"SECTOR_MOOD": "NA"})
             row = {"TIMESTAMP": now_iso, "SYMBOL": symbol, "TYPE": type_, "MODE": mode, "CONFIG_STRATEGY": strategy, "NOTES": notes, "UNDERLYING_FOR_OPTIONS": cfg["UNDERLYING_FOR_OPTIONS"], "MAX_RISK_MODE": cfg["MAX_RISK_MODE"], "STRIKE_OFFSET_STEPS": cfg["STRIKE_OFFSET_STEPS"], "SECTOR": sector_name, "MARKET_REGIME": snapshot["MARKET_REGIME"], **ema_plan, **dma_plan, **sr_plan, **options_plan, **pos_plan, "EARNINGS_EVENT_DATE": earnings_info.get("EVENT_DATE", ""), "EARNINGS_DAYS_LEFT": earnings_info.get("DAYS_LEFT", "")}
             row["INVALIDATION_STATUS"] = detect_invalidation(row, prev)
-            smart = compute_smart_score(row, snapshot["MARKET_REGIME"], sector_info)
-            row.update(smart)
-            prev_ema_signal = str(prev.get("EMA_LAST_SIGNAL", "")).strip().upper(); prev_ema_action = str(prev.get("EMA_LAST_ACTION", "")).strip().upper()
-            prev_dma_signal = str(prev.get("DMA_LAST_SIGNAL", "")).strip().upper(); prev_dma_action = str(prev.get("DMA_LAST_ACTION", "")).strip().upper()
+            row.update(compute_smart_score(row, snapshot["MARKET_REGIME"], sector_info))
+            prev_ema_signal = str(prev.get("EMA_LAST_SIGNAL", "")).strip().upper()
+            prev_ema_action = str(prev.get("EMA_LAST_ACTION", "")).strip().upper()
+            prev_dma_signal = str(prev.get("DMA_LAST_SIGNAL", "")).strip().upper()
+            prev_dma_action = str(prev.get("DMA_LAST_ACTION", "")).strip().upper()
             status_parts = []
-            if run_ema and (prev_ema_signal != str(ema_plan.get("EMA_SIGNAL", "")).upper() or prev_ema_action != str(ema_plan.get("EMA_ACTION", "")).upper()): status_parts.append("EMA_NEW_SIGNAL")
-            if run_dma and (prev_dma_signal != str(dma_plan.get("DMA_SIGNAL", "")).upper() or prev_dma_action != str(dma_plan.get("DMA_ACTION", "")).upper()): status_parts.append("DMA_NEW_SIGNAL")
-            if row["INVALIDATION_STATUS"] == "INVALIDATED" and str(prev.get("INVALIDATION_STATUS", "")).upper() != "INVALIDATED": status_parts.append("TRADE_INVALIDATED")
-            if row["SMART_ALERT"] == "NO": status_parts.append("SMART_FILTERED")
-            if not status_parts: status_parts.append("UNCHANGED")
+            signal_changed = False
+            if run_ema and (prev_ema_signal != str(ema_plan.get("EMA_SIGNAL", "")).upper() or prev_ema_action != str(ema_plan.get("EMA_ACTION", "")).upper()):
+                status_parts.append("EMA_NEW_SIGNAL")
+                signal_changed = True
+            if run_dma and (prev_dma_signal != str(dma_plan.get("DMA_SIGNAL", "")).upper() or prev_dma_action != str(dma_plan.get("DMA_ACTION", "")).upper()):
+                status_parts.append("DMA_NEW_SIGNAL")
+                signal_changed = True
+            if row["INVALIDATION_STATUS"] == "INVALIDATED" and str(prev.get("INVALIDATION_STATUS", "")).upper() != "INVALIDATED":
+                status_parts.append("TRADE_INVALIDATED")
+            if row["FAST_ALERT"] == "NO":
+                status_parts.append("FAST_FILTERED")
+            if row["HIGH_ALERT"] == "NO":
+                status_parts.append("HIGH_FILTERED")
+            if not status_parts:
+                status_parts.append("UNCHANGED")
             row["STATUS"] = " | ".join(status_parts)
             live_rows.append(row)
-            if row["SMART_ALERT"] == "YES" and row["SMART_SCORE"] >= 45 and (row.get("EMA_ACTION") in ("BUY","SELL") or row.get("DMA_ACTION") in ("BUY","SELL")) and "UNCHANGED" not in row["STATUS"]:
-                instant_alerts.append(f"{row['SYMBOL']} | {row['MODE']} | {row['ALERT_QUALITY']} | Score {row['SMART_SCORE']} | Sector {row['SECTOR']} {row['SECTOR_MOOD']} | Regime {row['MARKET_REGIME']} | Entry {row.get('EMA_ENTRY')} | SL {row.get('EMA_SL')} | Opt {row.get('OPTION_SIDE')}-{row.get('OPTION_SUGGESTED_STRIKE')}")
+            alert_key = f"ALERT|{symbol}|{mode}"
+            action = row.get("EMA_ACTION") if row.get("EMA_ACTION") in ("BUY", "SELL") else row.get("DMA_ACTION")
+            active_setup = action in ("BUY", "SELL") and row["INVALIDATION_STATUS"] != "INVALIDATED"
+            reminder_ok = should_send_reminder(alert_key, tg_state, now)
+            if row["FAST_ALERT"] == "YES" and active_setup and (signal_changed or reminder_ok):
+                label = "HIGH CONVICTION" if row["HIGH_ALERT"] == "YES" else "FAST ALERT"
+                message = f"{label}\n{row['SYMBOL']} | {row['MODE']} | Score {row['SMART_SCORE']} | {row['ALERT_QUALITY']}\nSector {row['SECTOR']} {row['SECTOR_MOOD']} | Regime {row['MARKET_REGIME']}\nEntry {row.get('EMA_ENTRY')} | SL {row.get('EMA_SL')} | T1 {row.get('EMA_TARGET_1')}\nOpt {row.get('OPTION_SIDE')}-{row.get('OPTION_SUGGESTED_STRIKE')} | Qty {row.get('SUGGESTED_QTY')}"
+                if row["HIGH_ALERT"] == "YES":
+                    high_alerts.append(message)
+                else:
+                    fast_alerts.append(message)
+                new_tg_rows = [r for r in new_tg_rows if r.get("KEY") != alert_key]
+                new_tg_rows.append({"KEY": alert_key, "SUMMARY_SLOT": "", "SUMMARY_DATE": today, "LAST_SENT_AT": now_iso, "LAST_ALERT_TYPE": label, "LAST_SYMBOL": symbol, "LAST_MODE": mode})
             if "TRADE_INVALIDATED" in row["STATUS"]:
-                invalidation_alerts.append(f"INVALIDATED: {row['SYMBOL']} {row['MODE']} | Price {row.get('EMA_LAST_PRICE')} crossed SL {row.get('EMA_SL')}")
+                invalidation_alerts.append(f"INVALIDATED\n{row['SYMBOL']} {row['MODE']} | Price {row.get('EMA_LAST_PRICE')} crossed SL {row.get('EMA_SL')}")
             state_rows.append({"SYMBOL": symbol, "TYPE": type_, "MODE": mode, "CONFIG_STRATEGY": strategy, "EMA_LAST_SIGNAL": ema_plan.get("EMA_SIGNAL", ""), "EMA_LAST_ACTION": ema_plan.get("EMA_ACTION", ""), "DMA_LAST_SIGNAL": dma_plan.get("DMA_SIGNAL", ""), "DMA_LAST_ACTION": dma_plan.get("DMA_ACTION", ""), "LAST_PRICE": ema_plan.get("EMA_LAST_PRICE", ""), "INVALIDATION_STATUS": row["INVALIDATION_STATUS"], "LAST_UPDATED": now_iso})
         except Exception as e:
             live_rows.append({"TIMESTAMP": now_iso, "SYMBOL": symbol, "TYPE": type_, "MODE": mode, "CONFIG_STRATEGY": strategy, "NOTES": notes, "UNDERLYING_FOR_OPTIONS": cfg["UNDERLYING_FOR_OPTIONS"], "MAX_RISK_MODE": cfg["MAX_RISK_MODE"], "STRIKE_OFFSET_STEPS": cfg["STRIKE_OFFSET_STEPS"], "STATUS": f"ERROR: {e}", "SMART_SCORE": 0})
@@ -586,16 +631,19 @@ def main():
     write_market_intelligence(sh, market_intel)
     write_earnings_calendar(sh, earnings_rows)
     write_sector_strength(sh, sector_rows)
-    if instant_alerts:
-        send_telegram("Immediate alerts\n" + "\n".join(instant_alerts[:10]))
+    if fast_alerts:
+        send_telegram("\n\n".join(fast_alerts[:10]))
+    if high_alerts:
+        send_telegram("\n\n".join(high_alerts[:10]))
     if invalidation_alerts:
-        send_telegram("Trade invalidation alerts\n" + "\n".join(invalidation_alerts[:10]))
+        send_telegram("\n\n".join(invalidation_alerts[:10]))
     slot = eligible_summary_slot(now)
     if should_send_summary(slot, tg_state, today):
         limit = 10 if slot == "20:30" else 5
         send_telegram(build_summary_message(slot, market_intel, live_rows, sector_rows, limit))
-        tg_state[slot] = {"SUMMARY_SLOT": slot, "SUMMARY_DATE": today, "LAST_SENT_AT": now_iso}
-        write_telegram_state(sh, list(tg_state.values()))
+        new_tg_rows = [r for r in new_tg_rows if r.get("KEY") != f"SUMMARY|{slot}"]
+        new_tg_rows.append({"KEY": f"SUMMARY|{slot}", "SUMMARY_SLOT": slot, "SUMMARY_DATE": today, "LAST_SENT_AT": now_iso, "LAST_ALERT_TYPE": "SUMMARY", "LAST_SYMBOL": "", "LAST_MODE": ""})
+    write_telegram_state(sh, new_tg_rows)
 
 if __name__ == "__main__":
     main()
