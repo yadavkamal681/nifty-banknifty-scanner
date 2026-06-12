@@ -32,6 +32,7 @@ SUMMARY_TIMES = ["09:10","09:25","10:00","11:00","11:30","12:00","12:30","13:00"
 FAST_ALERT_THRESHOLD = 32
 HIGH_ALERT_THRESHOLD = 50
 REMINDER_GAP_MINUTES = 12
+DEFAULT_DAILY_ALERT_CAP = 12
 SECTOR_MAP = {
     "BANKING": ["HDFCBANK.NS","ICICIBANK.NS","SBIN.NS","AXISBANK.NS","KOTAKBANK.NS"],
     "IT": ["TCS.NS","INFY.NS","WIPRO.NS","HCLTECH.NS","TECHM.NS"],
@@ -50,6 +51,7 @@ STOCK_TO_SECTOR = {
     "TATASTEEL":"METAL","JSWSTEEL":"METAL","HINDALCO":"METAL","VEDL":"METAL","NMDC":"METAL",
     "RELIANCE":"ENERGY","ONGC":"ENERGY","BPCL":"ENERGY","IOC":"ENERGY","POWERGRID":"ENERGY",
 }
+PRIORITY_SCORE_MAP = {"HIGH": 8, "MEDIUM": 3, "LOW": 0}
 
 def get_gspread_client():
     sa_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
@@ -65,7 +67,7 @@ def open_sheet():
         raise RuntimeError("SPREADSHEET_ID not set")
     return get_gspread_client().open_by_key(SPREADSHEET_ID)
 
-def ensure_sheet(sh, title: str, rows: str = "4000", cols: str = "180"):
+def ensure_sheet(sh, title: str, rows: str = "5000", cols: str = "200"):
     try:
         return sh.worksheet(title)
     except gspread.exceptions.WorksheetNotFound:
@@ -106,6 +108,10 @@ def parse_strategy(value: str) -> str:
     if strategy in ("BOTH", "ALL"): return BOTH_STRATEGY
     return EMA_STRATEGY
 
+def normalize_priority(v: str) -> str:
+    p = str(v or "MEDIUM").strip().upper()
+    return p if p in ("HIGH", "MEDIUM", "LOW") else "MEDIUM"
+
 def load_config(sh) -> List[Dict]:
     ws = sh.worksheet(CONFIG_SHEET)
     rows = ws.get_all_records()
@@ -121,11 +127,12 @@ def load_config(sh) -> List[Dict]:
         underlying = str(row.get("UNDERLYING FOR OPTIONS", symbol)).strip().upper() or symbol
         max_risk_mode = str(row.get("MAX RISK MODE", "NORMAL")).strip().upper() or "NORMAL"
         strike_offset_steps = safe_int(row.get("STRIKE OFFSET STEPS", 0), 0)
+        priority = normalize_priority(row.get("PRIORITY", "MEDIUM"))
         if not symbol or type_ not in ("INDEX", "STOCK"):
             continue
         modes = ["INTRADAY", "SWING"] if mode == "BOTH" else [mode]
         for m in modes:
-            out.append({"SYMBOL": symbol, "TYPE": type_, "MODE": m, "NOTES": notes, "STRATEGY": strategy, "UNDERLYING_FOR_OPTIONS": underlying, "MAX_RISK_MODE": max_risk_mode, "STRIKE_OFFSET_STEPS": strike_offset_steps})
+            out.append({"SYMBOL": symbol, "TYPE": type_, "MODE": m, "NOTES": notes, "STRATEGY": strategy, "UNDERLYING_FOR_OPTIONS": underlying, "MAX_RISK_MODE": max_risk_mode, "STRIKE_OFFSET_STEPS": strike_offset_steps, "PRIORITY": priority})
     return out
 
 def fetch_df(symbol: str, type_: str, period: str, interval: str) -> pd.DataFrame:
@@ -246,8 +253,8 @@ def ensure_risk_settings(sh):
     ws = ensure_sheet(sh, RISK_SETTINGS_SHEET)
     if ws.get_all_values():
         return
-    headers = ["TOTAL_CAPITAL","RISK_PERCENT_PER_TRADE","MAX_OPEN_TRADES","OPTION_LOT_SIZE_DEFAULT","MAX_DAILY_LOSS_PERCENT"]
-    defaults = ["100000","2","3","75","5"]
+    headers = ["TOTAL_CAPITAL","RISK_PERCENT_PER_TRADE","MAX_OPEN_TRADES","OPTION_LOT_SIZE_DEFAULT","MAX_DAILY_LOSS_PERCENT","DAILY_ALERT_CAP"]
+    defaults = ["100000","2","3","75","5",str(DEFAULT_DAILY_ALERT_CAP)]
     ws.update("A1", [headers, defaults])
 
 def load_risk_settings(sh) -> Dict:
@@ -255,7 +262,7 @@ def load_risk_settings(sh) -> Dict:
     ws = sh.worksheet(RISK_SETTINGS_SHEET)
     rows = ws.get_all_records()
     row = rows[0] if rows else {}
-    return {"TOTAL_CAPITAL": safe_float(row.get("TOTAL_CAPITAL", 100000), 100000),"RISK_PERCENT_PER_TRADE": safe_float(row.get("RISK_PERCENT_PER_TRADE", 2), 2),"MAX_OPEN_TRADES": safe_int(row.get("MAX_OPEN_TRADES", 3), 3),"OPTION_LOT_SIZE_DEFAULT": safe_int(row.get("OPTION_LOT_SIZE_DEFAULT", 75), 75),"MAX_DAILY_LOSS_PERCENT": safe_float(row.get("MAX_DAILY_LOSS_PERCENT", 5), 5)}
+    return {"TOTAL_CAPITAL": safe_float(row.get("TOTAL_CAPITAL", 100000), 100000),"RISK_PERCENT_PER_TRADE": safe_float(row.get("RISK_PERCENT_PER_TRADE", 2), 2),"MAX_OPEN_TRADES": safe_int(row.get("MAX_OPEN_TRADES", 3), 3),"OPTION_LOT_SIZE_DEFAULT": safe_int(row.get("OPTION_LOT_SIZE_DEFAULT", 75), 75),"MAX_DAILY_LOSS_PERCENT": safe_float(row.get("MAX_DAILY_LOSS_PERCENT", 5), 5),"DAILY_ALERT_CAP": safe_int(row.get("DAILY_ALERT_CAP", DEFAULT_DAILY_ALERT_CAP), DEFAULT_DAILY_ALERT_CAP)}
 
 def compute_position_sizing(entry: float, sl: float, risk_cfg: Dict, option_side: str) -> Dict:
     risk_per_trade_rupees = round(risk_cfg["TOTAL_CAPITAL"] * (risk_cfg["RISK_PERCENT_PER_TRADE"] / 100.0), 2)
@@ -291,7 +298,7 @@ def load_telegram_state(sh) -> Dict[str, Dict]:
 
 def write_telegram_state(sh, rows: List[Dict]):
     ws = ensure_sheet(sh, TELEGRAM_STATE_SHEET)
-    headers = ["KEY","SUMMARY_SLOT","SUMMARY_DATE","LAST_SENT_AT","LAST_ALERT_TYPE","LAST_SYMBOL","LAST_MODE"]
+    headers = ["KEY","SUMMARY_SLOT","SUMMARY_DATE","LAST_SENT_AT","LAST_ALERT_TYPE","LAST_SYMBOL","LAST_MODE","ALERT_COUNT_DATE","ALERT_COUNT"]
     write_table(ws, headers, rows)
 
 def fetch_news_headlines(query: str, page_size: int = 3) -> List[str]:
@@ -341,7 +348,36 @@ def market_snapshot() -> Dict:
         regime = "MIXED"
     return {"DATA": out, "NIFTY_MOOD": nifty_mood, "BANKNIFTY_MOOD": bank_mood, "RETAIL_SENTIMENT": retail, "MARKET_REGIME": regime}
 
-def build_market_intelligence(snapshot: Dict) -> Dict:
+def current_time_bucket(now: datetime) -> str:
+    hhmm = now.strftime("%H:%M")
+    if "09:15" <= hhmm <= "10:30":
+        return "OPEN_WINDOW"
+    if "10:31" <= hhmm <= "13:30":
+        return "MIDDAY"
+    if "13:31" <= hhmm <= "15:15":
+        return "LATE_SESSION"
+    return "OFF_MARKET"
+
+def time_rule_adjustments(bucket: str, mode: str) -> Dict:
+    fast = FAST_ALERT_THRESHOLD
+    high = HIGH_ALERT_THRESHOLD
+    bonus = 0
+    if bucket == "OPEN_WINDOW":
+        bonus = 5 if mode == "INTRADAY" else 2
+        fast -= 2
+    elif bucket == "MIDDAY":
+        bonus = 0
+    elif bucket == "LATE_SESSION":
+        bonus = -4 if mode == "INTRADAY" else 0
+        fast += 4 if mode == "INTRADAY" else 1
+        high += 2 if mode == "INTRADAY" else 0
+    else:
+        bonus = -8 if mode == "INTRADAY" else -2
+        fast += 8
+        high += 5
+    return {"TIME_BUCKET": bucket, "TIME_BONUS": bonus, "FAST_THRESHOLD": fast, "HIGH_THRESHOLD": high}
+
+def build_market_intelligence(snapshot: Dict, bucket: str) -> Dict:
     india_news = fetch_news_headlines("India stock market NSE Nifty Sensex", 3)
     global_news = fetch_news_headlines("US market Nasdaq S&P 500 inflation rates Fed", 3)
     earnings_news = fetch_news_headlines("India company earnings results NSE", 3)
@@ -351,7 +387,7 @@ def build_market_intelligence(snapshot: Dict) -> Dict:
     sentiment_label = "POSITIVE" if sentiment_score > 1 else "NEGATIVE" if sentiment_score < -1 else "NEUTRAL"
     price_action = f"NIFTY {snapshot['DATA'].get('NIFTY',{}).get('CHANGE_PCT','')}% | BANKNIFTY {snapshot['DATA'].get('BANKNIFTY',{}).get('CHANGE_PCT','')}%"
     global_mood = f"SPX {snapshot['DATA'].get('SPX',{}).get('CHANGE_PCT','')}% | NDQ {snapshot['DATA'].get('NASDAQ',{}).get('CHANGE_PCT','')}% | VIX {snapshot['DATA'].get('VIX',{}).get('CHANGE_PCT','')}%"
-    return {"TIMESTAMP": datetime.now(IST).isoformat(),"NIFTY_MOOD": snapshot["NIFTY_MOOD"],"BANKNIFTY_MOOD": snapshot["BANKNIFTY_MOOD"],"RETAIL_SENTIMENT": snapshot["RETAIL_SENTIMENT"],"MARKET_REGIME": snapshot["MARKET_REGIME"],"NEWS_SENTIMENT": sentiment_label,"NEWS_SENTIMENT_SCORE": sentiment_score,"PRICE_ACTION_MOVEMENT": price_action,"GLOBAL_MARKET_MOOD": global_mood,"INDIA_NEWS_1": india_news[0] if len(india_news)>0 else "","GLOBAL_NEWS_1": global_news[0] if len(global_news)>0 else "","EARNINGS_NEWS_1": earnings_news[0] if len(earnings_news)>0 else "","SECTOR_NEWS_1": sector_news[0] if len(sector_news)>0 else ""}
+    return {"TIMESTAMP": datetime.now(IST).isoformat(),"NIFTY_MOOD": snapshot["NIFTY_MOOD"],"BANKNIFTY_MOOD": snapshot["BANKNIFTY_MOOD"],"RETAIL_SENTIMENT": snapshot["RETAIL_SENTIMENT"],"MARKET_REGIME": snapshot["MARKET_REGIME"],"TIME_BUCKET": bucket,"NEWS_SENTIMENT": sentiment_label,"NEWS_SENTIMENT_SCORE": sentiment_score,"PRICE_ACTION_MOVEMENT": price_action,"GLOBAL_MARKET_MOOD": global_mood,"INDIA_NEWS_1": india_news[0] if len(india_news)>0 else "","GLOBAL_NEWS_1": global_news[0] if len(global_news)>0 else "","EARNINGS_NEWS_1": earnings_news[0] if len(earnings_news)>0 else "","SECTOR_NEWS_1": sector_news[0] if len(sector_news)>0 else ""}
 
 def write_market_intelligence(sh, row: Dict):
     ws = ensure_sheet(sh, MARKET_INTELLIGENCE_SHEET)
@@ -444,7 +480,7 @@ def write_sector_strength(sh, rows: List[Dict]):
 def sector_map_lookup(rows: List[Dict]) -> Dict[str, Dict]:
     return {r["SECTOR"]: r for r in rows}
 
-def compute_smart_score(row: Dict, market_regime: str, sector_info: Dict) -> Dict:
+def compute_smart_score(row: Dict, market_regime: str, sector_info: Dict, priority: str, time_adj: Dict) -> Dict:
     base = 0.0
     if row.get("EMA_ACTION") == "BUY": base += 25
     elif row.get("EMA_ACTION") == "SELL": base += 22
@@ -471,11 +507,13 @@ def compute_smart_score(row: Dict, market_regime: str, sector_info: Dict) -> Dic
     if market_regime == "TREND_DAY" and action in ("BUY", "SELL"): regime_bonus = 8
     elif market_regime == "CHOPPY" and row.get("MODE") == "INTRADAY": regime_bonus = -6
     elif market_regime == "HIGH_VOLATILITY": regime_bonus = -4
-    smart_score = round(base + sector_bonus + regime_bonus, 2)
-    quality = "HIGH" if smart_score >= HIGH_ALERT_THRESHOLD else "MEDIUM" if smart_score >= FAST_ALERT_THRESHOLD else "LOW"
-    fast_alert = "YES" if smart_score >= FAST_ALERT_THRESHOLD and action in ("BUY", "SELL") else "NO"
-    high_alert = "YES" if smart_score >= HIGH_ALERT_THRESHOLD and action in ("BUY", "SELL") else "NO"
-    return {"BASE_SCORE": round(base,2), "SECTOR_BONUS": sector_bonus, "REGIME_BONUS": regime_bonus, "SMART_SCORE": smart_score, "ALERT_QUALITY": quality, "FAST_ALERT": fast_alert, "HIGH_ALERT": high_alert, "SECTOR_MOOD": sector_mood}
+    priority_bonus = PRIORITY_SCORE_MAP.get(priority, 3)
+    time_bonus = time_adj["TIME_BONUS"]
+    smart_score = round(base + sector_bonus + regime_bonus + priority_bonus + time_bonus, 2)
+    quality = "HIGH" if smart_score >= time_adj["HIGH_THRESHOLD"] else "MEDIUM" if smart_score >= time_adj["FAST_THRESHOLD"] else "LOW"
+    fast_alert = "YES" if smart_score >= time_adj["FAST_THRESHOLD"] and action in ("BUY", "SELL") else "NO"
+    high_alert = "YES" if smart_score >= time_adj["HIGH_THRESHOLD"] and action in ("BUY", "SELL") else "NO"
+    return {"BASE_SCORE": round(base,2), "SECTOR_BONUS": sector_bonus, "REGIME_BONUS": regime_bonus, "PRIORITY_BONUS": priority_bonus, "TIME_BONUS": time_bonus, "SMART_SCORE": smart_score, "ALERT_QUALITY": quality, "FAST_ALERT": fast_alert, "HIGH_ALERT": high_alert, "SECTOR_MOOD": sector_mood, "TIME_BUCKET": time_adj["TIME_BUCKET"], "FAST_THRESHOLD": time_adj["FAST_THRESHOLD"], "HIGH_THRESHOLD": time_adj["HIGH_THRESHOLD"]}
 
 def send_telegram(message: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -488,10 +526,10 @@ def send_telegram(message: str):
 def build_top_table(rows: List[Dict], limit: int = 5) -> str:
     ranked = sorted(rows, key=lambda x: x.get("SMART_SCORE", 0), reverse=True)[:limit]
     if not ranked: return "No ranked setups"
-    lines = ["SYMBOL | ACT | SCORE | QLTY | SECTOR | ENTRY | OPT"]
+    lines = ["SYMBOL | P | ACT | SCORE | TIME | ENTRY | OPT"]
     for r in ranked:
         act = r.get("EMA_ACTION") if r.get("EMA_ACTION") in ("BUY", "SELL") else r.get("DMA_ACTION")
-        lines.append(f"{r['SYMBOL']} | {act} | {r.get('SMART_SCORE')} | {r.get('ALERT_QUALITY')} | {r.get('SECTOR','')}:{r.get('SECTOR_MOOD','')} | {r.get('EMA_ENTRY','')} | {r.get('OPTION_SIDE','')}-{r.get('OPTION_SUGGESTED_STRIKE','')}")
+        lines.append(f"{r['SYMBOL']} | {r.get('PRIORITY')} | {act} | {r.get('SMART_SCORE')} | {r.get('TIME_BUCKET')} | {r.get('EMA_ENTRY','')} | {r.get('OPTION_SIDE','')}-{r.get('OPTION_SUGGESTED_STRIKE','')}")
     return "\n".join(lines)
 
 def build_summary_message(slot: str, mi: Dict, rows: List[Dict], sector_rows: List[Dict], limit: int) -> str:
@@ -500,7 +538,7 @@ def build_summary_message(slot: str, mi: Dict, rows: List[Dict], sector_rows: Li
     top_sectors = ", ".join([f"{r['SECTOR']} {r['AVG_CHANGE_PCT']}%" for r in sector_rows[:3]]) if sector_rows else "No sector data"
     news_lines = [x for x in [mi.get("INDIA_NEWS_1",""), mi.get("GLOBAL_NEWS_1",""), mi.get("EARNINGS_NEWS_1",""), mi.get("SECTOR_NEWS_1","")] if x]
     news_block = "\n".join([f"- {x}" for x in news_lines[:4]]) if news_lines else "- No fresh news headlines"
-    return f"[{slot} IST] Market Summary\nRegime: {mi.get('MARKET_REGIME','')}\nNIFTY: {mi.get('NIFTY_MOOD','')} | BANKNIFTY: {mi.get('BANKNIFTY_MOOD','')}\nRetail: {mi.get('RETAIL_SENTIMENT','')} | News: {mi.get('NEWS_SENTIMENT','')} ({mi.get('NEWS_SENTIMENT_SCORE','')})\nPrice action: {mi.get('PRICE_ACTION_MOVEMENT','')}\nTop sectors: {top_sectors}\nEarnings watch: {earnings_line}\n\nTop setups\n{build_top_table(rows, limit)}\n\nKey news\n{news_block}"
+    return f"[{slot} IST] Market Summary\nRegime: {mi.get('MARKET_REGIME','')} | Time: {mi.get('TIME_BUCKET','')}\nNIFTY: {mi.get('NIFTY_MOOD','')} | BANKNIFTY: {mi.get('BANKNIFTY_MOOD','')}\nRetail: {mi.get('RETAIL_SENTIMENT','')} | News: {mi.get('NEWS_SENTIMENT','')} ({mi.get('NEWS_SENTIMENT_SCORE','')})\nPrice action: {mi.get('PRICE_ACTION_MOVEMENT','')}\nTop sectors: {top_sectors}\nEarnings watch: {earnings_line}\n\nTop setups\n{build_top_table(rows, limit)}\n\nKey news\n{news_block}"
 
 def eligible_summary_slot(now: datetime) -> str:
     chosen = ""
@@ -528,15 +566,25 @@ def should_send_reminder(key: str, tg_state: Dict[str, Dict], now: datetime) -> 
     except Exception:
         return True
 
+def get_daily_alert_count(tg_state: Dict[str, Dict], today: str) -> int:
+    meta = tg_state.get("DAILY_ALERT_COUNTER", {})
+    if str(meta.get("ALERT_COUNT_DATE", "")) == today:
+        return safe_int(meta.get("ALERT_COUNT", 0), 0)
+    return 0
+
+def set_daily_alert_count(rows: List[Dict], today: str, count: int):
+    rows[:] = [r for r in rows if r.get("KEY") != "DAILY_ALERT_COUNTER"]
+    rows.append({"KEY": "DAILY_ALERT_COUNTER", "SUMMARY_SLOT": "", "SUMMARY_DATE": today, "LAST_SENT_AT": "", "LAST_ALERT_TYPE": "COUNTER", "LAST_SYMBOL": "", "LAST_MODE": "", "ALERT_COUNT_DATE": today, "ALERT_COUNT": count})
+
 def write_live_signals(sh, rows: List[Dict]):
     ws = ensure_sheet(sh, LIVE_SHEET)
-    headers = ["TIMESTAMP","SYMBOL","TYPE","MODE","CONFIG_STRATEGY","NOTES","UNDERLYING_FOR_OPTIONS","MAX_RISK_MODE","STRIKE_OFFSET_STEPS","SECTOR","SECTOR_MOOD","MARKET_REGIME","EMA_LAST_PRICE","EMA_CHANGE_PCT","EMA9","EMA21","EMA50","EMA_RECENT_HIGH","EMA_RECENT_LOW","EMA_ATR","EMA_BIAS","EMA_ACTION","EMA_SIGNAL","EMA_ENTRY","EMA_SL","EMA_TARGET_1","EMA_TARGET_2","EMA_TARGET_3","EMA_RR","DMA50","DMA100","DMA200","DMA_SIGNAL","DMA_ACTION","DMA_ENTRY","DMA_SL","DMA_TARGET_1","DMA_TARGET_2","DMA_TARGET_3","DMA_RR","DMA_STATUS","SUPPORT_1","SUPPORT_2","SUPPORT_3","RESISTANCE_1","RESISTANCE_2","RESISTANCE_3","PIVOT","OPTION_UNDERLYING","OPTION_SIDE","OPTION_BASE_STRIKE","OPTION_SUGGESTED_STRIKE","OPTION_STRIKE_STEP","OPTION_MAX_RISK_MODE","OPTION_STRIKE_OFFSET_STEPS","OPTION_RISK_POINTS","RISK_PER_TRADE_RUPEES","RISK_PER_UNIT","SUGGESTED_QTY","SUGGESTED_LOTS","MAX_OPEN_TRADES","MAX_DAILY_LOSS_PERCENT","INVALIDATION_STATUS","EARNINGS_EVENT_DATE","EARNINGS_DAYS_LEFT","BASE_SCORE","SECTOR_BONUS","REGIME_BONUS","SMART_SCORE","ALERT_QUALITY","FAST_ALERT","HIGH_ALERT","STATUS"]
+    headers = ["TIMESTAMP","SYMBOL","TYPE","MODE","PRIORITY","CONFIG_STRATEGY","NOTES","UNDERLYING_FOR_OPTIONS","MAX_RISK_MODE","STRIKE_OFFSET_STEPS","SECTOR","SECTOR_MOOD","MARKET_REGIME","TIME_BUCKET","FAST_THRESHOLD","HIGH_THRESHOLD","EMA_LAST_PRICE","EMA_CHANGE_PCT","EMA9","EMA21","EMA50","EMA_RECENT_HIGH","EMA_RECENT_LOW","EMA_ATR","EMA_BIAS","EMA_ACTION","EMA_SIGNAL","EMA_ENTRY","EMA_SL","EMA_TARGET_1","EMA_TARGET_2","EMA_TARGET_3","EMA_RR","DMA50","DMA100","DMA200","DMA_SIGNAL","DMA_ACTION","DMA_ENTRY","DMA_SL","DMA_TARGET_1","DMA_TARGET_2","DMA_TARGET_3","DMA_RR","DMA_STATUS","SUPPORT_1","SUPPORT_2","SUPPORT_3","RESISTANCE_1","RESISTANCE_2","RESISTANCE_3","PIVOT","OPTION_UNDERLYING","OPTION_SIDE","OPTION_BASE_STRIKE","OPTION_SUGGESTED_STRIKE","OPTION_STRIKE_STEP","OPTION_MAX_RISK_MODE","OPTION_STRIKE_OFFSET_STEPS","OPTION_RISK_POINTS","RISK_PER_TRADE_RUPEES","RISK_PER_UNIT","SUGGESTED_QTY","SUGGESTED_LOTS","MAX_OPEN_TRADES","MAX_DAILY_LOSS_PERCENT","INVALIDATION_STATUS","EARNINGS_EVENT_DATE","EARNINGS_DAYS_LEFT","BASE_SCORE","SECTOR_BONUS","REGIME_BONUS","PRIORITY_BONUS","TIME_BONUS","SMART_SCORE","ALERT_QUALITY","FAST_ALERT","HIGH_ALERT","STATUS"]
     write_table(ws, headers, rows)
 
 def write_ranked_signals(sh, rows: List[Dict]):
     ws = ensure_sheet(sh, RANKED_SHEET)
     ranked = sorted(rows, key=lambda x: x.get("SMART_SCORE", 0), reverse=True)
-    headers = ["TIMESTAMP","SYMBOL","TYPE","MODE","SECTOR","SECTOR_MOOD","MARKET_REGIME","SMART_SCORE","ALERT_QUALITY","FAST_ALERT","HIGH_ALERT","EMA_ACTION","DMA_ACTION","EMA_ENTRY","EMA_SL","EMA_TARGET_1","EMA_RR","SUGGESTED_QTY","SUGGESTED_LOTS","INVALIDATION_STATUS","EARNINGS_EVENT_DATE","EARNINGS_DAYS_LEFT","SUPPORT_1","RESISTANCE_1","OPTION_SIDE","OPTION_SUGGESTED_STRIKE","OPTION_RISK_POINTS","STATUS"]
+    headers = ["TIMESTAMP","SYMBOL","TYPE","MODE","PRIORITY","SECTOR","SECTOR_MOOD","MARKET_REGIME","TIME_BUCKET","SMART_SCORE","ALERT_QUALITY","FAST_ALERT","HIGH_ALERT","EMA_ACTION","DMA_ACTION","EMA_ENTRY","EMA_SL","EMA_TARGET_1","EMA_RR","SUGGESTED_QTY","SUGGESTED_LOTS","INVALIDATION_STATUS","EARNINGS_EVENT_DATE","EARNINGS_DAYS_LEFT","SUPPORT_1","RESISTANCE_1","OPTION_SIDE","OPTION_SUGGESTED_STRIKE","OPTION_RISK_POINTS","STATUS"]
     write_table(ws, headers, ranked)
 
 def main():
@@ -548,16 +596,19 @@ def main():
     tg_state = load_telegram_state(sh)
     now = datetime.now(IST)
     now_iso = now.isoformat(); today = now.strftime("%Y-%m-%d")
+    bucket = current_time_bucket(now)
     snapshot = market_snapshot()
-    market_intel = build_market_intelligence(snapshot)
+    market_intel = build_market_intelligence(snapshot, bucket)
     earnings_rows = fetch_earnings_calendar(cfg_rows)
     earnings_map = earnings_lookup_map(earnings_rows)
     sector_rows = compute_sector_strength()
     sector_lookup = sector_map_lookup(sector_rows)
-    live_rows, state_rows, fast_alerts, high_alerts, invalidation_alerts = [], [], [], [], []
-    new_tg_rows = [v for v in tg_state.values() if str(v.get('KEY','')).startswith('SUMMARY|')]
+    live_rows, state_rows, candidate_alerts, high_alerts, invalidation_alerts = [], [], [], [], []
+    new_tg_rows = [v for v in tg_state.values() if str(v.get('KEY','')).startswith('SUMMARY|') or str(v.get('KEY','')).startswith('ALERT|') or str(v.get('KEY','')) == 'DAILY_ALERT_COUNTER']
+    daily_count = get_daily_alert_count(tg_state, today)
+    daily_cap = risk_cfg.get("DAILY_ALERT_CAP", DEFAULT_DAILY_ALERT_CAP)
     for cfg in cfg_rows:
-        symbol, type_, mode, notes, strategy = cfg["SYMBOL"], cfg["TYPE"], cfg["MODE"], cfg["NOTES"], cfg["STRATEGY"]
+        symbol, type_, mode, notes, strategy, priority = cfg["SYMBOL"], cfg["TYPE"], cfg["MODE"], cfg["NOTES"], cfg["STRATEGY"], cfg["PRIORITY"]
         key = f"{symbol}|{mode}"
         prev = state_map.get(key, {})
         try:
@@ -580,9 +631,10 @@ def main():
             earnings_info = earnings_map.get(symbol, {})
             sector_name = STOCK_TO_SECTOR.get(symbol, "INDEX") if type_ == "STOCK" else symbol
             sector_info = sector_lookup.get(sector_name, {"SECTOR_MOOD": "NA"})
-            row = {"TIMESTAMP": now_iso, "SYMBOL": symbol, "TYPE": type_, "MODE": mode, "CONFIG_STRATEGY": strategy, "NOTES": notes, "UNDERLYING_FOR_OPTIONS": cfg["UNDERLYING_FOR_OPTIONS"], "MAX_RISK_MODE": cfg["MAX_RISK_MODE"], "STRIKE_OFFSET_STEPS": cfg["STRIKE_OFFSET_STEPS"], "SECTOR": sector_name, "MARKET_REGIME": snapshot["MARKET_REGIME"], **ema_plan, **dma_plan, **sr_plan, **options_plan, **pos_plan, "EARNINGS_EVENT_DATE": earnings_info.get("EVENT_DATE", ""), "EARNINGS_DAYS_LEFT": earnings_info.get("DAYS_LEFT", "")}
+            time_adj = time_rule_adjustments(bucket, mode)
+            row = {"TIMESTAMP": now_iso, "SYMBOL": symbol, "TYPE": type_, "MODE": mode, "PRIORITY": priority, "CONFIG_STRATEGY": strategy, "NOTES": notes, "UNDERLYING_FOR_OPTIONS": cfg["UNDERLYING_FOR_OPTIONS"], "MAX_RISK_MODE": cfg["MAX_RISK_MODE"], "STRIKE_OFFSET_STEPS": cfg["STRIKE_OFFSET_STEPS"], "SECTOR": sector_name, "MARKET_REGIME": snapshot["MARKET_REGIME"], **ema_plan, **dma_plan, **sr_plan, **options_plan, **pos_plan, "EARNINGS_EVENT_DATE": earnings_info.get("EVENT_DATE", ""), "EARNINGS_DAYS_LEFT": earnings_info.get("DAYS_LEFT", "")}
             row["INVALIDATION_STATUS"] = detect_invalidation(row, prev)
-            row.update(compute_smart_score(row, snapshot["MARKET_REGIME"], sector_info))
+            row.update(compute_smart_score(row, snapshot["MARKET_REGIME"], sector_info, priority, time_adj))
             prev_ema_signal = str(prev.get("EMA_LAST_SIGNAL", "")).strip().upper()
             prev_ema_action = str(prev.get("EMA_LAST_ACTION", "")).strip().upper()
             prev_dma_signal = str(prev.get("DMA_LAST_SIGNAL", "")).strip().upper()
@@ -611,19 +663,24 @@ def main():
             reminder_ok = should_send_reminder(alert_key, tg_state, now)
             if row["FAST_ALERT"] == "YES" and active_setup and (signal_changed or reminder_ok):
                 label = "HIGH CONVICTION" if row["HIGH_ALERT"] == "YES" else "FAST ALERT"
-                message = f"{label}\n{row['SYMBOL']} | {row['MODE']} | Score {row['SMART_SCORE']} | {row['ALERT_QUALITY']}\nSector {row['SECTOR']} {row['SECTOR_MOOD']} | Regime {row['MARKET_REGIME']}\nEntry {row.get('EMA_ENTRY')} | SL {row.get('EMA_SL')} | T1 {row.get('EMA_TARGET_1')}\nOpt {row.get('OPTION_SIDE')}-{row.get('OPTION_SUGGESTED_STRIKE')} | Qty {row.get('SUGGESTED_QTY')}"
-                if row["HIGH_ALERT"] == "YES":
-                    high_alerts.append(message)
-                else:
-                    fast_alerts.append(message)
-                new_tg_rows = [r for r in new_tg_rows if r.get("KEY") != alert_key]
-                new_tg_rows.append({"KEY": alert_key, "SUMMARY_SLOT": "", "SUMMARY_DATE": today, "LAST_SENT_AT": now_iso, "LAST_ALERT_TYPE": label, "LAST_SYMBOL": symbol, "LAST_MODE": mode})
+                row_message = f"{label}\n{row['SYMBOL']} | {row['MODE']} | Priority {row['PRIORITY']} | Score {row['SMART_SCORE']}\nTime {row['TIME_BUCKET']} | Sector {row['SECTOR']} {row['SECTOR_MOOD']} | Regime {row['MARKET_REGIME']}\nEntry {row.get('EMA_ENTRY')} | SL {row.get('EMA_SL')} | T1 {row.get('EMA_TARGET_1')}\nOpt {row.get('OPTION_SIDE')}-{row.get('OPTION_SUGGESTED_STRIKE')} | Qty {row.get('SUGGESTED_QTY')}"
+                candidate_alerts.append((row["SMART_SCORE"], PRIORITY_SCORE_MAP.get(priority, 3), row_message, label, alert_key, symbol, mode, row["HIGH_ALERT"]))
             if "TRADE_INVALIDATED" in row["STATUS"]:
                 invalidation_alerts.append(f"INVALIDATED\n{row['SYMBOL']} {row['MODE']} | Price {row.get('EMA_LAST_PRICE')} crossed SL {row.get('EMA_SL')}")
             state_rows.append({"SYMBOL": symbol, "TYPE": type_, "MODE": mode, "CONFIG_STRATEGY": strategy, "EMA_LAST_SIGNAL": ema_plan.get("EMA_SIGNAL", ""), "EMA_LAST_ACTION": ema_plan.get("EMA_ACTION", ""), "DMA_LAST_SIGNAL": dma_plan.get("DMA_SIGNAL", ""), "DMA_LAST_ACTION": dma_plan.get("DMA_ACTION", ""), "LAST_PRICE": ema_plan.get("EMA_LAST_PRICE", ""), "INVALIDATION_STATUS": row["INVALIDATION_STATUS"], "LAST_UPDATED": now_iso})
         except Exception as e:
-            live_rows.append({"TIMESTAMP": now_iso, "SYMBOL": symbol, "TYPE": type_, "MODE": mode, "CONFIG_STRATEGY": strategy, "NOTES": notes, "UNDERLYING_FOR_OPTIONS": cfg["UNDERLYING_FOR_OPTIONS"], "MAX_RISK_MODE": cfg["MAX_RISK_MODE"], "STRIKE_OFFSET_STEPS": cfg["STRIKE_OFFSET_STEPS"], "STATUS": f"ERROR: {e}", "SMART_SCORE": 0})
+            live_rows.append({"TIMESTAMP": now_iso, "SYMBOL": symbol, "TYPE": type_, "MODE": mode, "PRIORITY": priority, "CONFIG_STRATEGY": strategy, "NOTES": notes, "UNDERLYING_FOR_OPTIONS": cfg["UNDERLYING_FOR_OPTIONS"], "MAX_RISK_MODE": cfg["MAX_RISK_MODE"], "STRIKE_OFFSET_STEPS": cfg["STRIKE_OFFSET_STEPS"], "STATUS": f"ERROR: {e}", "SMART_SCORE": 0})
             state_rows.append({"SYMBOL": symbol, "TYPE": type_, "MODE": mode, "CONFIG_STRATEGY": strategy, "EMA_LAST_SIGNAL": "ERROR", "EMA_LAST_ACTION": "ERROR", "DMA_LAST_SIGNAL": "ERROR", "DMA_LAST_ACTION": "ERROR", "LAST_PRICE": "", "INVALIDATION_STATUS": "ERROR", "LAST_UPDATED": now_iso})
+    candidate_alerts.sort(key=lambda x: (x[1], x[0]), reverse=True)
+    remaining_capacity = max(daily_cap - daily_count, 0)
+    selected = candidate_alerts[:remaining_capacity]
+    for _, _, message, label, alert_key, symbol, mode, is_high in selected:
+        send_telegram(message)
+        daily_count += 1
+        new_tg_rows = [r for r in new_tg_rows if r.get("KEY") != alert_key]
+        new_tg_rows.append({"KEY": alert_key, "SUMMARY_SLOT": "", "SUMMARY_DATE": today, "LAST_SENT_AT": now_iso, "LAST_ALERT_TYPE": label, "LAST_SYMBOL": symbol, "LAST_MODE": mode, "ALERT_COUNT_DATE": today, "ALERT_COUNT": daily_count})
+    if invalidation_alerts:
+        send_telegram("\n\n".join(invalidation_alerts[:10]))
     write_live_signals(sh, live_rows)
     write_ranked_signals(sh, live_rows)
     write_state_map(sh, state_rows)
@@ -631,18 +688,13 @@ def main():
     write_market_intelligence(sh, market_intel)
     write_earnings_calendar(sh, earnings_rows)
     write_sector_strength(sh, sector_rows)
-    if fast_alerts:
-        send_telegram("\n\n".join(fast_alerts[:10]))
-    if high_alerts:
-        send_telegram("\n\n".join(high_alerts[:10]))
-    if invalidation_alerts:
-        send_telegram("\n\n".join(invalidation_alerts[:10]))
     slot = eligible_summary_slot(now)
     if should_send_summary(slot, tg_state, today):
         limit = 10 if slot == "20:30" else 5
-        send_telegram(build_summary_message(slot, market_intel, live_rows, sector_rows, limit))
+        send_telegram(build_summary_message(slot, live_rows=live_rows, mi=market_intel, sector_rows=sector_rows, limit=limit))
         new_tg_rows = [r for r in new_tg_rows if r.get("KEY") != f"SUMMARY|{slot}"]
-        new_tg_rows.append({"KEY": f"SUMMARY|{slot}", "SUMMARY_SLOT": slot, "SUMMARY_DATE": today, "LAST_SENT_AT": now_iso, "LAST_ALERT_TYPE": "SUMMARY", "LAST_SYMBOL": "", "LAST_MODE": ""})
+        new_tg_rows.append({"KEY": f"SUMMARY|{slot}", "SUMMARY_SLOT": slot, "SUMMARY_DATE": today, "LAST_SENT_AT": now_iso, "LAST_ALERT_TYPE": "SUMMARY", "LAST_SYMBOL": "", "LAST_MODE": "", "ALERT_COUNT_DATE": today, "ALERT_COUNT": daily_count})
+    set_daily_alert_count(new_tg_rows, today, daily_count)
     write_telegram_state(sh, new_tg_rows)
 
 if __name__ == "__main__":
