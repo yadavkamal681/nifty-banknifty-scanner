@@ -21,6 +21,7 @@ MARKET_INTELLIGENCE_SHEET = "MARKET_INTELLIGENCE"
 TELEGRAM_STATE_SHEET = "TELEGRAM_STATE"
 RISK_SETTINGS_SHEET = "RISK_SETTINGS"
 EARNINGS_SHEET = "EARNINGS_CALENDAR"
+SECTOR_SHEET = "SECTOR_STRENGTH"
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 NEWSAPI_KEY = os.environ.get("NEWSAPI_KEY", "")
@@ -28,6 +29,24 @@ EMA_STRATEGY = "EMA_BREAKOUT"
 DMA_STRATEGY = "DMA"
 BOTH_STRATEGY = "BOTH"
 SUMMARY_TIMES = ["09:10","09:25","10:00","11:00","11:30","12:00","12:30","13:00","13:30","14:00","14:30","15:20","20:30"]
+SECTOR_MAP = {
+    "BANKING": ["HDFCBANK.NS","ICICIBANK.NS","SBIN.NS","AXISBANK.NS","KOTAKBANK.NS"],
+    "IT": ["TCS.NS","INFY.NS","WIPRO.NS","HCLTECH.NS","TECHM.NS"],
+    "PHARMA": ["SUNPHARMA.NS","DRREDDY.NS","CIPLA.NS","DIVISLAB.NS","LUPIN.NS"],
+    "AUTO": ["MARUTI.NS","TATAMOTORS.NS","M&M.NS","EICHERMOT.NS","BAJAJ-AUTO.NS"],
+    "FMCG": ["HINDUNILVR.NS","ITC.NS","NESTLEIND.NS","BRITANNIA.NS","DABUR.NS"],
+    "METAL": ["TATASTEEL.NS","JSWSTEEL.NS","HINDALCO.NS","VEDL.NS","NMDC.NS"],
+    "ENERGY": ["RELIANCE.NS","ONGC.NS","BPCL.NS","IOC.NS","POWERGRID.NS"],
+}
+STOCK_TO_SECTOR = {
+    "HDFCBANK":"BANKING","ICICIBANK":"BANKING","SBIN":"BANKING","AXISBANK":"BANKING","KOTAKBANK":"BANKING",
+    "TCS":"IT","INFY":"IT","WIPRO":"IT","HCLTECH":"IT","TECHM":"IT",
+    "SUNPHARMA":"PHARMA","DRREDDY":"PHARMA","CIPLA":"PHARMA","DIVISLAB":"PHARMA","LUPIN":"PHARMA",
+    "MARUTI":"AUTO","TATAMOTORS":"AUTO","M&M":"AUTO","EICHERMOT":"AUTO","BAJAJ-AUTO":"AUTO",
+    "HINDUNILVR":"FMCG","ITC":"FMCG","NESTLEIND":"FMCG","BRITANNIA":"FMCG","DABUR":"FMCG",
+    "TATASTEEL":"METAL","JSWSTEEL":"METAL","HINDALCO":"METAL","VEDL":"METAL","NMDC":"METAL",
+    "RELIANCE":"ENERGY","ONGC":"ENERGY","BPCL":"ENERGY","IOC":"ENERGY","POWERGRID":"ENERGY",
+}
 
 def get_gspread_client():
     sa_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
@@ -43,7 +62,7 @@ def open_sheet():
         raise RuntimeError("SPREADSHEET_ID not set")
     return get_gspread_client().open_by_key(SPREADSHEET_ID)
 
-def ensure_sheet(sh, title: str, rows: str = "3000", cols: str = "140"):
+def ensure_sheet(sh, title: str, rows: str = "3000", cols: str = "160"):
     try:
         return sh.worksheet(title)
     except gspread.exceptions.WorksheetNotFound:
@@ -205,24 +224,6 @@ def derive_dma_plan(df: pd.DataFrame, type_: str) -> Dict:
     rr = round((t1 - entry) / (entry - sl), 2) if action == "BUY" and entry > sl else round((entry - t1) / (sl - entry), 2) if action == "SELL" and sl > entry else 0.0
     return {"DMA50":round(d50,2),"DMA100":round(d100,2),"DMA200":round(d200,2),"DMA_SIGNAL":signal,"DMA_ACTION":action,"DMA_ENTRY":entry,"DMA_SL":sl,"DMA_TARGET_1":t1,"DMA_TARGET_2":t2,"DMA_TARGET_3":t3,"DMA_RR":rr,"DMA_STATUS":status}
 
-def compute_signal_score(row: Dict) -> float:
-    score = 0.0
-    if row.get("EMA_ACTION") == "BUY": score += 25
-    elif row.get("EMA_ACTION") == "SELL": score += 22
-    if row.get("DMA_ACTION") == "BUY": score += 20
-    elif row.get("DMA_ACTION") == "SELL": score += 16
-    if row.get("EMA_BIAS") == "BULLISH": score += 10
-    elif row.get("EMA_BIAS") == "BEARISH": score += 8
-    score += min(max(safe_float(row.get("EMA_RR", 0), 0), 0), 5) * 8
-    score += min(abs(safe_float(row.get("EMA_CHANGE_PCT", 0), 0)), 5) * 3
-    if row.get("MODE") == "INTRADAY": score += 4
-    if row.get("CONFIG_STRATEGY") == "BOTH": score += 6
-    if row.get("EARNINGS_DAYS_LEFT") not in ("", None):
-        days_left = safe_int(row.get("EARNINGS_DAYS_LEFT", 99), 99)
-        if days_left <= 3: score -= 8
-        elif days_left <= 7: score -= 4
-    return round(score, 2)
-
 def option_side_from_action(action: str) -> str:
     if action == "BUY": return "CE"
     if action == "SELL": return "PE"
@@ -240,8 +241,7 @@ def build_options_plan(symbol: str, type_: str, underlying: str, last_price: flo
 
 def ensure_risk_settings(sh):
     ws = ensure_sheet(sh, RISK_SETTINGS_SHEET)
-    values = ws.get_all_values()
-    if values:
+    if ws.get_all_values():
         return
     headers = ["TOTAL_CAPITAL","RISK_PERCENT_PER_TRADE","MAX_OPEN_TRADES","OPTION_LOT_SIZE_DEFAULT","MAX_DAILY_LOSS_PERCENT"]
     defaults = ["100000","2","3","75","5"]
@@ -317,10 +317,21 @@ def market_snapshot() -> Dict:
             out[name] = {"LAST": round(last_p, 2), "CHANGE_PCT": chg}
         except Exception:
             out[name] = {"LAST": "", "CHANGE_PCT": ""}
-    nifty_mood = "BULLISH" if safe_float(out.get("NIFTY", {}).get("CHANGE_PCT", 0), 0) > 0 else "BEARISH" if safe_float(out.get("NIFTY", {}).get("CHANGE_PCT", 0), 0) < 0 else "NEUTRAL"
-    banknifty_mood = "BULLISH" if safe_float(out.get("BANKNIFTY", {}).get("CHANGE_PCT", 0), 0) > 0 else "BEARISH" if safe_float(out.get("BANKNIFTY", {}).get("CHANGE_PCT", 0), 0) < 0 else "NEUTRAL"
-    retail_sentiment = "RISK-ON" if nifty_mood == "BULLISH" and banknifty_mood == "BULLISH" else "RISK-OFF" if nifty_mood == "BEARISH" and banknifty_mood == "BEARISH" else "MIXED"
-    return {"DATA": out, "NIFTY_MOOD": nifty_mood, "BANKNIFTY_MOOD": banknifty_mood, "RETAIL_SENTIMENT": retail_sentiment}
+    nifty_chg = safe_float(out.get("NIFTY", {}).get("CHANGE_PCT", 0), 0)
+    bank_chg = safe_float(out.get("BANKNIFTY", {}).get("CHANGE_PCT", 0), 0)
+    vix_chg = safe_float(out.get("VIX", {}).get("CHANGE_PCT", 0), 0)
+    nifty_mood = "BULLISH" if nifty_chg > 0 else "BEARISH" if nifty_chg < 0 else "NEUTRAL"
+    bank_mood = "BULLISH" if bank_chg > 0 else "BEARISH" if bank_chg < 0 else "NEUTRAL"
+    retail = "RISK-ON" if nifty_mood == "BULLISH" and bank_mood == "BULLISH" else "RISK-OFF" if nifty_mood == "BEARISH" and bank_mood == "BEARISH" else "MIXED"
+    if abs(nifty_chg) > 0.6 and abs(bank_chg) > 0.6 and nifty_chg * bank_chg > 0:
+        regime = "TREND_DAY"
+    elif abs(nifty_chg) < 0.2 and abs(bank_chg) < 0.2:
+        regime = "CHOPPY"
+    elif vix_chg > 2:
+        regime = "HIGH_VOLATILITY"
+    else:
+        regime = "MIXED"
+    return {"DATA": out, "NIFTY_MOOD": nifty_mood, "BANKNIFTY_MOOD": bank_mood, "RETAIL_SENTIMENT": retail, "MARKET_REGIME": regime}
 
 def build_market_intelligence(snapshot: Dict) -> Dict:
     india_news = fetch_news_headlines("India stock market NSE Nifty Sensex", 3)
@@ -332,7 +343,7 @@ def build_market_intelligence(snapshot: Dict) -> Dict:
     sentiment_label = "POSITIVE" if sentiment_score > 1 else "NEGATIVE" if sentiment_score < -1 else "NEUTRAL"
     price_action = f"NIFTY {snapshot['DATA'].get('NIFTY',{}).get('CHANGE_PCT','')}% | BANKNIFTY {snapshot['DATA'].get('BANKNIFTY',{}).get('CHANGE_PCT','')}%"
     global_mood = f"SPX {snapshot['DATA'].get('SPX',{}).get('CHANGE_PCT','')}% | NDQ {snapshot['DATA'].get('NASDAQ',{}).get('CHANGE_PCT','')}% | VIX {snapshot['DATA'].get('VIX',{}).get('CHANGE_PCT','')}%"
-    return {"TIMESTAMP": datetime.now(IST).isoformat(),"NIFTY_MOOD": snapshot["NIFTY_MOOD"],"BANKNIFTY_MOOD": snapshot["BANKNIFTY_MOOD"],"RETAIL_SENTIMENT": snapshot["RETAIL_SENTIMENT"],"NEWS_SENTIMENT": sentiment_label,"NEWS_SENTIMENT_SCORE": sentiment_score,"PRICE_ACTION_MOVEMENT": price_action,"GLOBAL_MARKET_MOOD": global_mood,"INDIA_NEWS_1": india_news[0] if len(india_news)>0 else "","GLOBAL_NEWS_1": global_news[0] if len(global_news)>0 else "","EARNINGS_NEWS_1": earnings_news[0] if len(earnings_news)>0 else "","SECTOR_NEWS_1": sector_news[0] if len(sector_news)>0 else ""}
+    return {"TIMESTAMP": datetime.now(IST).isoformat(),"NIFTY_MOOD": snapshot["NIFTY_MOOD"],"BANKNIFTY_MOOD": snapshot["BANKNIFTY_MOOD"],"RETAIL_SENTIMENT": snapshot["RETAIL_SENTIMENT"],"MARKET_REGIME": snapshot["MARKET_REGIME"],"NEWS_SENTIMENT": sentiment_label,"NEWS_SENTIMENT_SCORE": sentiment_score,"PRICE_ACTION_MOVEMENT": price_action,"GLOBAL_MARKET_MOOD": global_mood,"INDIA_NEWS_1": india_news[0] if len(india_news)>0 else "","GLOBAL_NEWS_1": global_news[0] if len(global_news)>0 else "","EARNINGS_NEWS_1": earnings_news[0] if len(earnings_news)>0 else "","SECTOR_NEWS_1": sector_news[0] if len(sector_news)>0 else ""}
 
 def write_market_intelligence(sh, row: Dict):
     ws = ensure_sheet(sh, MARKET_INTELLIGENCE_SHEET)
@@ -395,13 +406,67 @@ def detect_invalidation(row: Dict, prev_state: Dict) -> str:
     price = safe_float(row.get("EMA_LAST_PRICE", 0), 0)
     sl = safe_float(row.get("EMA_SL", 0), 0) or safe_float(row.get("DMA_SL", 0), 0)
     prev_status = str(prev_state.get("INVALIDATION_STATUS", "")).upper()
-    if action == "BUY" and sl and price < sl:
-        return "INVALIDATED"
-    if action == "SELL" and sl and price > sl:
-        return "INVALIDATED"
-    if action in ("BUY", "SELL"):
-        return "ACTIVE"
+    if action == "BUY" and sl and price < sl: return "INVALIDATED"
+    if action == "SELL" and sl and price > sl: return "INVALIDATED"
+    if action in ("BUY", "SELL"): return "ACTIVE"
     return prev_status or "IDLE"
+
+def compute_sector_strength() -> List[Dict]:
+    rows = []
+    for sector, tickers in SECTOR_MAP.items():
+        changes = []
+        for ticker in tickers:
+            try:
+                df = yf.download(ticker, period="5d", interval="1d", auto_adjust=True, progress=False)
+                c = get_series(df, "Close")
+                if len(c) >= 2:
+                    changes.append(((float(c.iloc[-1]) - float(c.iloc[-2])) / float(c.iloc[-2])) * 100.0)
+            except Exception:
+                pass
+        avg_change = round(sum(changes) / len(changes), 2) if changes else 0.0
+        mood = "STRONG" if avg_change > 0.7 else "WEAK" if avg_change < -0.7 else "NEUTRAL"
+        rows.append({"SECTOR": sector, "AVG_CHANGE_PCT": avg_change, "SECTOR_MOOD": mood})
+    return sorted(rows, key=lambda x: x["AVG_CHANGE_PCT"], reverse=True)
+
+def write_sector_strength(sh, rows: List[Dict]):
+    ws = ensure_sheet(sh, SECTOR_SHEET)
+    headers = ["SECTOR","AVG_CHANGE_PCT","SECTOR_MOOD"]
+    write_table(ws, headers, rows)
+
+def sector_map_lookup(rows: List[Dict]) -> Dict[str, Dict]:
+    return {r["SECTOR"]: r for r in rows}
+
+def compute_smart_score(row: Dict, market_regime: str, sector_info: Dict) -> Dict:
+    base = 0.0
+    if row.get("EMA_ACTION") == "BUY": base += 25
+    elif row.get("EMA_ACTION") == "SELL": base += 22
+    if row.get("DMA_ACTION") == "BUY": base += 20
+    elif row.get("DMA_ACTION") == "SELL": base += 16
+    if row.get("EMA_BIAS") == "BULLISH": base += 10
+    elif row.get("EMA_BIAS") == "BEARISH": base += 8
+    base += min(max(safe_float(row.get("EMA_RR", 0), 0), 0), 5) * 8
+    base += min(abs(safe_float(row.get("EMA_CHANGE_PCT", 0), 0)), 5) * 3
+    if row.get("MODE") == "INTRADAY": base += 4
+    if row.get("CONFIG_STRATEGY") == "BOTH": base += 6
+    if row.get("EARNINGS_DAYS_LEFT") not in ("", None):
+        days_left = safe_int(row.get("EARNINGS_DAYS_LEFT", 99), 99)
+        if days_left <= 3: base -= 8
+        elif days_left <= 7: base -= 4
+    sector_bonus = 0
+    sector_mood = sector_info.get("SECTOR_MOOD", "NA") if sector_info else "NA"
+    action = row.get("EMA_ACTION") if row.get("EMA_ACTION") in ("BUY", "SELL") else row.get("DMA_ACTION")
+    if action == "BUY" and sector_mood == "STRONG": sector_bonus = 8
+    elif action == "SELL" and sector_mood == "WEAK": sector_bonus = 8
+    elif sector_mood == "NEUTRAL": sector_bonus = 0
+    else: sector_bonus = -4 if sector_mood != "NA" else 0
+    regime_bonus = 0
+    if market_regime == "TREND_DAY" and action in ("BUY", "SELL"): regime_bonus = 8
+    elif market_regime == "CHOPPY" and row.get("MODE") == "INTRADAY": regime_bonus = -10
+    elif market_regime == "HIGH_VOLATILITY": regime_bonus = -4
+    smart_score = round(base + sector_bonus + regime_bonus, 2)
+    quality = "HIGH" if smart_score >= 55 else "MEDIUM" if smart_score >= 35 else "LOW"
+    smart_alert = "YES" if quality == "HIGH" or (quality == "MEDIUM" and market_regime == "TREND_DAY") else "NO"
+    return {"BASE_SCORE": round(base,2), "SECTOR_BONUS": sector_bonus, "REGIME_BONUS": regime_bonus, "SMART_SCORE": smart_score, "ALERT_QUALITY": quality, "SMART_ALERT": smart_alert, "SECTOR_MOOD": sector_mood}
 
 def send_telegram(message: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -412,20 +477,21 @@ def send_telegram(message: str):
         pass
 
 def build_top_table(rows: List[Dict], limit: int = 5) -> str:
-    ranked = sorted(rows, key=lambda x: x.get("SIGNAL_SCORE", 0), reverse=True)[:limit]
+    ranked = sorted(rows, key=lambda x: x.get("SMART_SCORE", 0), reverse=True)[:limit]
     if not ranked: return "No ranked setups"
-    lines = ["SYMBOL | ACT | SCORE | ENTRY | SL | QTY | OPT"]
+    lines = ["SYMBOL | ACT | SCORE | QLTY | SECTOR | ENTRY | OPT"]
     for r in ranked:
         act = r.get("EMA_ACTION") if r.get("EMA_ACTION") in ("BUY", "SELL") else r.get("DMA_ACTION")
-        lines.append(f"{r['SYMBOL']} | {act} | {r['SIGNAL_SCORE']} | {r.get('EMA_ENTRY','')} | {r.get('EMA_SL','')} | {r.get('SUGGESTED_QTY','')} | {r.get('OPTION_SIDE','')}-{r.get('OPTION_SUGGESTED_STRIKE','')}")
+        lines.append(f"{r['SYMBOL']} | {act} | {r.get('SMART_SCORE')} | {r.get('ALERT_QUALITY')} | {r.get('SECTOR','')}:{r.get('SECTOR_MOOD','')} | {r.get('EMA_ENTRY','')} | {r.get('OPTION_SIDE','')}-{r.get('OPTION_SUGGESTED_STRIKE','')}")
     return "\n".join(lines)
 
-def build_summary_message(slot: str, mi: Dict, rows: List[Dict], limit: int) -> str:
+def build_summary_message(slot: str, mi: Dict, rows: List[Dict], sector_rows: List[Dict], limit: int) -> str:
     earnings_watch = [r for r in rows if safe_int(r.get("EARNINGS_DAYS_LEFT", 99), 99) <= 7]
     earnings_line = ", ".join([f"{r['SYMBOL']}({r.get('EARNINGS_DAYS_LEFT')})" for r in earnings_watch[:5]]) if earnings_watch else "No near earnings"
+    top_sectors = ", ".join([f"{r['SECTOR']} {r['AVG_CHANGE_PCT']}%" for r in sector_rows[:3]]) if sector_rows else "No sector data"
     news_lines = [x for x in [mi.get("INDIA_NEWS_1",""), mi.get("GLOBAL_NEWS_1",""), mi.get("EARNINGS_NEWS_1",""), mi.get("SECTOR_NEWS_1","")] if x]
     news_block = "\n".join([f"- {x}" for x in news_lines[:4]]) if news_lines else "- No fresh news headlines"
-    return f"[{slot} IST] Market Summary\nNIFTY: {mi.get('NIFTY_MOOD','')} | BANKNIFTY: {mi.get('BANKNIFTY_MOOD','')}\nRetail: {mi.get('RETAIL_SENTIMENT','')} | News: {mi.get('NEWS_SENTIMENT','')} ({mi.get('NEWS_SENTIMENT_SCORE','')})\nPrice action: {mi.get('PRICE_ACTION_MOVEMENT','')}\nGlobal: {mi.get('GLOBAL_MARKET_MOOD','')}\nEarnings watch: {earnings_line}\n\nTop setups\n{build_top_table(rows, limit)}\n\nKey news\n{news_block}"
+    return f"[{slot} IST] Market Summary\nRegime: {mi.get('MARKET_REGIME','')}\nNIFTY: {mi.get('NIFTY_MOOD','')} | BANKNIFTY: {mi.get('BANKNIFTY_MOOD','')}\nRetail: {mi.get('RETAIL_SENTIMENT','')} | News: {mi.get('NEWS_SENTIMENT','')} ({mi.get('NEWS_SENTIMENT_SCORE','')})\nPrice action: {mi.get('PRICE_ACTION_MOVEMENT','')}\nTop sectors: {top_sectors}\nEarnings watch: {earnings_line}\n\nTop setups\n{build_top_table(rows, limit)}\n\nKey news\n{news_block}"
 
 def eligible_summary_slot(now: datetime) -> str:
     chosen = ""
@@ -442,13 +508,13 @@ def should_send_summary(slot: str, tg_state: Dict[str, Dict], today: str) -> boo
 
 def write_live_signals(sh, rows: List[Dict]):
     ws = ensure_sheet(sh, LIVE_SHEET)
-    headers = ["TIMESTAMP","SYMBOL","TYPE","MODE","CONFIG_STRATEGY","NOTES","UNDERLYING_FOR_OPTIONS","MAX_RISK_MODE","STRIKE_OFFSET_STEPS","EMA_LAST_PRICE","EMA_CHANGE_PCT","EMA9","EMA21","EMA50","EMA_RECENT_HIGH","EMA_RECENT_LOW","EMA_ATR","EMA_BIAS","EMA_ACTION","EMA_SIGNAL","EMA_ENTRY","EMA_SL","EMA_TARGET_1","EMA_TARGET_2","EMA_TARGET_3","EMA_RR","DMA50","DMA100","DMA200","DMA_SIGNAL","DMA_ACTION","DMA_ENTRY","DMA_SL","DMA_TARGET_1","DMA_TARGET_2","DMA_TARGET_3","DMA_RR","DMA_STATUS","SUPPORT_1","SUPPORT_2","SUPPORT_3","RESISTANCE_1","RESISTANCE_2","RESISTANCE_3","PIVOT","OPTION_UNDERLYING","OPTION_SIDE","OPTION_BASE_STRIKE","OPTION_SUGGESTED_STRIKE","OPTION_STRIKE_STEP","OPTION_MAX_RISK_MODE","OPTION_STRIKE_OFFSET_STEPS","OPTION_RISK_POINTS","RISK_PER_TRADE_RUPEES","RISK_PER_UNIT","SUGGESTED_QTY","SUGGESTED_LOTS","MAX_OPEN_TRADES","MAX_DAILY_LOSS_PERCENT","INVALIDATION_STATUS","EARNINGS_EVENT_DATE","EARNINGS_DAYS_LEFT","SIGNAL_SCORE","STATUS"]
+    headers = ["TIMESTAMP","SYMBOL","TYPE","MODE","CONFIG_STRATEGY","NOTES","UNDERLYING_FOR_OPTIONS","MAX_RISK_MODE","STRIKE_OFFSET_STEPS","SECTOR","SECTOR_MOOD","MARKET_REGIME","EMA_LAST_PRICE","EMA_CHANGE_PCT","EMA9","EMA21","EMA50","EMA_RECENT_HIGH","EMA_RECENT_LOW","EMA_ATR","EMA_BIAS","EMA_ACTION","EMA_SIGNAL","EMA_ENTRY","EMA_SL","EMA_TARGET_1","EMA_TARGET_2","EMA_TARGET_3","EMA_RR","DMA50","DMA100","DMA200","DMA_SIGNAL","DMA_ACTION","DMA_ENTRY","DMA_SL","DMA_TARGET_1","DMA_TARGET_2","DMA_TARGET_3","DMA_RR","DMA_STATUS","SUPPORT_1","SUPPORT_2","SUPPORT_3","RESISTANCE_1","RESISTANCE_2","RESISTANCE_3","PIVOT","OPTION_UNDERLYING","OPTION_SIDE","OPTION_BASE_STRIKE","OPTION_SUGGESTED_STRIKE","OPTION_STRIKE_STEP","OPTION_MAX_RISK_MODE","OPTION_STRIKE_OFFSET_STEPS","OPTION_RISK_POINTS","RISK_PER_TRADE_RUPEES","RISK_PER_UNIT","SUGGESTED_QTY","SUGGESTED_LOTS","MAX_OPEN_TRADES","MAX_DAILY_LOSS_PERCENT","INVALIDATION_STATUS","EARNINGS_EVENT_DATE","EARNINGS_DAYS_LEFT","BASE_SCORE","SECTOR_BONUS","REGIME_BONUS","SMART_SCORE","ALERT_QUALITY","SMART_ALERT","STATUS"]
     write_table(ws, headers, rows)
 
 def write_ranked_signals(sh, rows: List[Dict]):
     ws = ensure_sheet(sh, RANKED_SHEET)
-    ranked = sorted(rows, key=lambda x: x.get("SIGNAL_SCORE", 0), reverse=True)
-    headers = ["TIMESTAMP","SYMBOL","TYPE","MODE","CONFIG_STRATEGY","SIGNAL_SCORE","EMA_BIAS","EMA_ACTION","DMA_ACTION","EMA_ENTRY","EMA_SL","EMA_TARGET_1","EMA_RR","SUGGESTED_QTY","SUGGESTED_LOTS","INVALIDATION_STATUS","EARNINGS_EVENT_DATE","EARNINGS_DAYS_LEFT","SUPPORT_1","RESISTANCE_1","OPTION_SIDE","OPTION_SUGGESTED_STRIKE","OPTION_RISK_POINTS","STATUS"]
+    ranked = sorted(rows, key=lambda x: x.get("SMART_SCORE", 0), reverse=True)
+    headers = ["TIMESTAMP","SYMBOL","TYPE","MODE","SECTOR","SECTOR_MOOD","MARKET_REGIME","SMART_SCORE","ALERT_QUALITY","SMART_ALERT","EMA_ACTION","DMA_ACTION","EMA_ENTRY","EMA_SL","EMA_TARGET_1","EMA_RR","SUGGESTED_QTY","SUGGESTED_LOTS","INVALIDATION_STATUS","EARNINGS_EVENT_DATE","EARNINGS_DAYS_LEFT","SUPPORT_1","RESISTANCE_1","OPTION_SIDE","OPTION_SUGGESTED_STRIKE","OPTION_RISK_POINTS","STATUS"]
     write_table(ws, headers, ranked)
 
 def main():
@@ -464,6 +530,8 @@ def main():
     market_intel = build_market_intelligence(snapshot)
     earnings_rows = fetch_earnings_calendar(cfg_rows)
     earnings_map = earnings_lookup_map(earnings_rows)
+    sector_rows = compute_sector_strength()
+    sector_lookup = sector_map_lookup(sector_rows)
     live_rows, state_rows, instant_alerts, invalidation_alerts = [], [], [], []
     for cfg in cfg_rows:
         symbol, type_, mode, notes, strategy = cfg["SYMBOL"], cfg["TYPE"], cfg["MODE"], cfg["NOTES"], cfg["STRATEGY"]
@@ -487,25 +555,29 @@ def main():
             options_plan = build_options_plan(symbol, type_, cfg["UNDERLYING_FOR_OPTIONS"], safe_float(ema_plan.get("EMA_LAST_PRICE", 0), 0), pref_action, pref_entry, pref_sl, cfg["STRIKE_OFFSET_STEPS"], cfg["MAX_RISK_MODE"])
             pos_plan = compute_position_sizing(pref_entry, pref_sl, risk_cfg, options_plan.get("OPTION_SIDE", "WAIT"))
             earnings_info = earnings_map.get(symbol, {})
-            row = {"TIMESTAMP": now_iso, "SYMBOL": symbol, "TYPE": type_, "MODE": mode, "CONFIG_STRATEGY": strategy, "NOTES": notes, "UNDERLYING_FOR_OPTIONS": cfg["UNDERLYING_FOR_OPTIONS"], "MAX_RISK_MODE": cfg["MAX_RISK_MODE"], "STRIKE_OFFSET_STEPS": cfg["STRIKE_OFFSET_STEPS"], **ema_plan, **dma_plan, **sr_plan, **options_plan, **pos_plan, "EARNINGS_EVENT_DATE": earnings_info.get("EVENT_DATE", ""), "EARNINGS_DAYS_LEFT": earnings_info.get("DAYS_LEFT", "")}
+            sector_name = STOCK_TO_SECTOR.get(symbol, "INDEX") if type_ == "STOCK" else symbol
+            sector_info = sector_lookup.get(sector_name, {"SECTOR_MOOD": "NA"})
+            row = {"TIMESTAMP": now_iso, "SYMBOL": symbol, "TYPE": type_, "MODE": mode, "CONFIG_STRATEGY": strategy, "NOTES": notes, "UNDERLYING_FOR_OPTIONS": cfg["UNDERLYING_FOR_OPTIONS"], "MAX_RISK_MODE": cfg["MAX_RISK_MODE"], "STRIKE_OFFSET_STEPS": cfg["STRIKE_OFFSET_STEPS"], "SECTOR": sector_name, "MARKET_REGIME": snapshot["MARKET_REGIME"], **ema_plan, **dma_plan, **sr_plan, **options_plan, **pos_plan, "EARNINGS_EVENT_DATE": earnings_info.get("EVENT_DATE", ""), "EARNINGS_DAYS_LEFT": earnings_info.get("DAYS_LEFT", "")}
             row["INVALIDATION_STATUS"] = detect_invalidation(row, prev)
-            row["SIGNAL_SCORE"] = compute_signal_score(row)
+            smart = compute_smart_score(row, snapshot["MARKET_REGIME"], sector_info)
+            row.update(smart)
             prev_ema_signal = str(prev.get("EMA_LAST_SIGNAL", "")).strip().upper(); prev_ema_action = str(prev.get("EMA_LAST_ACTION", "")).strip().upper()
             prev_dma_signal = str(prev.get("DMA_LAST_SIGNAL", "")).strip().upper(); prev_dma_action = str(prev.get("DMA_LAST_ACTION", "")).strip().upper()
             status_parts = []
             if run_ema and (prev_ema_signal != str(ema_plan.get("EMA_SIGNAL", "")).upper() or prev_ema_action != str(ema_plan.get("EMA_ACTION", "")).upper()): status_parts.append("EMA_NEW_SIGNAL")
             if run_dma and (prev_dma_signal != str(dma_plan.get("DMA_SIGNAL", "")).upper() or prev_dma_action != str(dma_plan.get("DMA_ACTION", "")).upper()): status_parts.append("DMA_NEW_SIGNAL")
             if row["INVALIDATION_STATUS"] == "INVALIDATED" and str(prev.get("INVALIDATION_STATUS", "")).upper() != "INVALIDATED": status_parts.append("TRADE_INVALIDATED")
+            if row["SMART_ALERT"] == "NO": status_parts.append("SMART_FILTERED")
             if not status_parts: status_parts.append("UNCHANGED")
             row["STATUS"] = " | ".join(status_parts)
             live_rows.append(row)
-            if row["SIGNAL_SCORE"] >= 35 and (row.get("EMA_ACTION") in ("BUY","SELL") or row.get("DMA_ACTION") in ("BUY","SELL")) and "UNCHANGED" not in row["STATUS"]:
-                instant_alerts.append(f"{row['SYMBOL']} | {row['MODE']} | Score {row['SIGNAL_SCORE']} | Entry {row.get('EMA_ENTRY')} | SL {row.get('EMA_SL')} | Qty {row.get('SUGGESTED_QTY')} | Lots {row.get('SUGGESTED_LOTS')} | Opt {row.get('OPTION_SIDE')}-{row.get('OPTION_SUGGESTED_STRIKE')}")
+            if row["SMART_ALERT"] == "YES" and row["SMART_SCORE"] >= 45 and (row.get("EMA_ACTION") in ("BUY","SELL") or row.get("DMA_ACTION") in ("BUY","SELL")) and "UNCHANGED" not in row["STATUS"]:
+                instant_alerts.append(f"{row['SYMBOL']} | {row['MODE']} | {row['ALERT_QUALITY']} | Score {row['SMART_SCORE']} | Sector {row['SECTOR']} {row['SECTOR_MOOD']} | Regime {row['MARKET_REGIME']} | Entry {row.get('EMA_ENTRY')} | SL {row.get('EMA_SL')} | Opt {row.get('OPTION_SIDE')}-{row.get('OPTION_SUGGESTED_STRIKE')}")
             if "TRADE_INVALIDATED" in row["STATUS"]:
                 invalidation_alerts.append(f"INVALIDATED: {row['SYMBOL']} {row['MODE']} | Price {row.get('EMA_LAST_PRICE')} crossed SL {row.get('EMA_SL')}")
             state_rows.append({"SYMBOL": symbol, "TYPE": type_, "MODE": mode, "CONFIG_STRATEGY": strategy, "EMA_LAST_SIGNAL": ema_plan.get("EMA_SIGNAL", ""), "EMA_LAST_ACTION": ema_plan.get("EMA_ACTION", ""), "DMA_LAST_SIGNAL": dma_plan.get("DMA_SIGNAL", ""), "DMA_LAST_ACTION": dma_plan.get("DMA_ACTION", ""), "LAST_PRICE": ema_plan.get("EMA_LAST_PRICE", ""), "INVALIDATION_STATUS": row["INVALIDATION_STATUS"], "LAST_UPDATED": now_iso})
         except Exception as e:
-            live_rows.append({"TIMESTAMP": now_iso, "SYMBOL": symbol, "TYPE": type_, "MODE": mode, "CONFIG_STRATEGY": strategy, "NOTES": notes, "UNDERLYING_FOR_OPTIONS": cfg["UNDERLYING_FOR_OPTIONS"], "MAX_RISK_MODE": cfg["MAX_RISK_MODE"], "STRIKE_OFFSET_STEPS": cfg["STRIKE_OFFSET_STEPS"], "STATUS": f"ERROR: {e}", "SIGNAL_SCORE": 0})
+            live_rows.append({"TIMESTAMP": now_iso, "SYMBOL": symbol, "TYPE": type_, "MODE": mode, "CONFIG_STRATEGY": strategy, "NOTES": notes, "UNDERLYING_FOR_OPTIONS": cfg["UNDERLYING_FOR_OPTIONS"], "MAX_RISK_MODE": cfg["MAX_RISK_MODE"], "STRIKE_OFFSET_STEPS": cfg["STRIKE_OFFSET_STEPS"], "STATUS": f"ERROR: {e}", "SMART_SCORE": 0})
             state_rows.append({"SYMBOL": symbol, "TYPE": type_, "MODE": mode, "CONFIG_STRATEGY": strategy, "EMA_LAST_SIGNAL": "ERROR", "EMA_LAST_ACTION": "ERROR", "DMA_LAST_SIGNAL": "ERROR", "DMA_LAST_ACTION": "ERROR", "LAST_PRICE": "", "INVALIDATION_STATUS": "ERROR", "LAST_UPDATED": now_iso})
     write_live_signals(sh, live_rows)
     write_ranked_signals(sh, live_rows)
@@ -513,6 +585,7 @@ def main():
     ensure_trading_journal(sh)
     write_market_intelligence(sh, market_intel)
     write_earnings_calendar(sh, earnings_rows)
+    write_sector_strength(sh, sector_rows)
     if instant_alerts:
         send_telegram("Immediate alerts\n" + "\n".join(instant_alerts[:10]))
     if invalidation_alerts:
@@ -520,7 +593,7 @@ def main():
     slot = eligible_summary_slot(now)
     if should_send_summary(slot, tg_state, today):
         limit = 10 if slot == "20:30" else 5
-        send_telegram(build_summary_message(slot, market_intel, live_rows, limit))
+        send_telegram(build_summary_message(slot, market_intel, live_rows, sector_rows, limit))
         tg_state[slot] = {"SUMMARY_SLOT": slot, "SUMMARY_DATE": today, "LAST_SENT_AT": now_iso}
         write_telegram_state(sh, list(tg_state.values()))
 
